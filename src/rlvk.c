@@ -1,0 +1,6434 @@
+/**********************************************************************************************
+*
+*   rlvk - raylib OpenGL abstraction layer (rlgl) reimplemented on top of Vulkan 1.2+ (volk)
+*
+*   IMPLEMENTATION NOTES (contract additions / documented choices)
+*
+*   [1] CLIP SPACE
+*       User-visible matrices (rlGetMatrixProjection/Modelview, rlFrustum/rlOrtho) keep the
+*       OpenGL convention (right-handed, depth -1..1, Y up) so raylib's math (GetWorldToScreen,
+*       GetScreenToWorld, GetMouseRay) works unchanged. The GL->Vulkan clip correction
+*       (Y flip + depth remap z' = (z + w)/2) is applied ONLY when the MVP push constant is
+*       built at draw time. Viewports are set with POSITIVE height (no VK_KHR_maintenance1
+*       negative-height trick) - the correction matrix is the single source of truth.
+*       Render targets differ: the swapchain is Y-flipped (top-down storage), while user
+*       framebuffers skip the flip so their content is stored bottom-up exactly like an
+*       OpenGL FBO. That keeps raylib's negative-height source idiom
+*       (DrawTextureRec(rt.texture, (Rectangle){ 0, 0, w, -h }, ...)) rendering upright and
+*       makes rlReadTexturePixels() of a render texture match GL raylib. Front-face winding
+*       is part of the pipeline key and follows the flip (CW when flipped, CCW when not).
+*
+*   [2] UNIFORM LOCATION ENCODING (rlGetLocationUniform)
+*       - A plain uniform (member of set 0, binding 0 UBO) returns its BYTE OFFSET in the UBO
+*         (>= 0). rlSetUniform() writes at that offset into the shader's CPU shadow buffer.
+*       - A sampler (set 1, binding b) returns 0x01000000 | b. rlSetUniformSampler() accepts
+*         that encoding (and also a bare 0..3 binding index for convenience).
+*       - Not found returns -1.
+*       Encoding constants: RLVK_LOC_SAMPLER_FLAG = 0x01000000, mask 0xFF.
+*
+*   [3] MISSING VERTEX ATTRIBUTES
+*       Pipelines are built with exactly the vertex attributes the shader consumes (from
+*       SPIR-V reflection). Attributes that are consumed but not provided by the mesh are
+*       fed from a small shared "default attribute" buffer bound with stride 0 and
+*       VK_VERTEX_INPUT_RATE_VERTEX: a zero stride is legal in core Vulkan (only an upper
+*       bound, maxVertexInputBindingStride, is specified) and makes every vertex read
+*       element 0, which reproduces the GL "constant attribute" behaviour exactly and works
+*       for instanced draws too.
+*
+*   [4] SHARED PIPELINE LAYOUT
+*       Every shader uses the same descriptor set layouts (set 0: one uniform buffer,
+*       set 1: four combined image samplers) and the same 128-byte push constant range,
+*       so a single VkPipelineLayout is shared by all pipelines. It is still exposed
+*       per-shader in the shader table (same handle), which is compatible with the
+*       "pipeline layout per shader" contract wording.
+*
+*   [5] SCREEN CAPTURE
+*       The finished swapchain image is copied into a dedicated capture image at the end
+*       of every frame (before the present barrier). rlReadScreenPixels() between frames
+*       reads that copy, because a presentable image must not be touched once it has been
+*       handed to vkQueuePresentKHR. Called mid-frame (TakeScreenshot inside EndDrawing)
+*       it split-submits the frame commands and reads the in-flight image instead.
+*
+*   [6] MATRIX UPLOAD
+*       Matrices are written to push constants/UBOs in subscript order m0..m15 (same as
+*       raymath's MatrixToFloatV), which is the TRANSPOSE of the Matrix struct's memory
+*       layout. A raw memcpy would upload a transposed matrix.
+*
+*   [7] rayvk.h line 7 comment fixed: it wrote "void*" and "uint64" separated by a bare
+*       slash, which formed a comment terminator and ended the header comment early,
+*       making the header uncompilable. rlvk.h was NOT modified.
+*
+*   License: zlib/libpng (same as raylib)
+*
+**********************************************************************************************/
+
+#include "rlvk.h"
+
+#include "rayvk.h"
+#include "volk.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+//----------------------------------------------------------------------------------
+// Allocators (standard raylib fallback pattern)
+//----------------------------------------------------------------------------------
+#ifndef RL_MALLOC
+    #define RL_MALLOC(sz)       malloc(sz)
+#endif
+#ifndef RL_CALLOC
+    #define RL_CALLOC(n,sz)     calloc(n,sz)
+#endif
+#ifndef RL_REALLOC
+    #define RL_REALLOC(ptr,sz)  realloc(ptr,sz)
+#endif
+#ifndef RL_FREE
+    #define RL_FREE(ptr)        free(ptr)
+#endif
+
+#ifndef TRACELOG
+    #define TRACELOG(level, ...) TraceLog(level, __VA_ARGS__)
+#endif
+
+#ifndef RL_MAX_SHADER_LOCATIONS
+    #define RL_MAX_SHADER_LOCATIONS 32
+#endif
+
+//----------------------------------------------------------------------------------
+// Embedded default shaders (generated by the build from src/shaders/default.*)
+//----------------------------------------------------------------------------------
+extern const unsigned char default_vert_spv_data[];
+extern const unsigned int default_vert_spv_size;
+extern const unsigned char default_frag_spv_data[];
+extern const unsigned int default_frag_spv_size;
+
+//----------------------------------------------------------------------------------
+// Internal defines
+//----------------------------------------------------------------------------------
+#define RLVK_MAX_FRAMES_IN_FLIGHT   2
+#define RLVK_MAX_TEXTURE_SLOTS      4
+#define RLVK_LOC_SAMPLER_FLAG       0x01000000
+#define RLVK_LOC_SAMPLER_MASK       0x000000FF
+#define RLVK_CHUNK_SIZE             (4u*1024u*1024u)
+#define RLVK_DESC_SETS_PER_POOL     512
+#define RLVK_PUSH_CONSTANT_SIZE     128
+#define RLVK_MAX_UNIFORM_NAME       64
+
+// Vertex attribute locations (shader ABI, see rlvk.h)
+#define RLVK_LOC_POSITION       0
+#define RLVK_LOC_TEXCOORD       1
+#define RLVK_LOC_NORMAL         2
+#define RLVK_LOC_COLOR          3
+#define RLVK_LOC_TANGENT        4
+#define RLVK_LOC_TEXCOORD2      5
+#define RLVK_LOC_BONEIDS        6
+#define RLVK_LOC_BONEWEIGHTS    7
+#define RLVK_LOC_INSTANCE       8   // .. 11 (mat4)
+
+// GL blend factor/equation constants (rcore/raylib pass these through rlSetBlendFactors)
+#define RLVK_GL_ZERO                        0x0000
+#define RLVK_GL_ONE                         0x0001
+#define RLVK_GL_SRC_COLOR                   0x0300
+#define RLVK_GL_ONE_MINUS_SRC_COLOR         0x0301
+#define RLVK_GL_SRC_ALPHA                   0x0302
+#define RLVK_GL_ONE_MINUS_SRC_ALPHA         0x0303
+#define RLVK_GL_DST_ALPHA                   0x0304
+#define RLVK_GL_ONE_MINUS_DST_ALPHA         0x0305
+#define RLVK_GL_DST_COLOR                   0x0306
+#define RLVK_GL_ONE_MINUS_DST_COLOR         0x0307
+#define RLVK_GL_SRC_ALPHA_SATURATE          0x0308
+#define RLVK_GL_CONSTANT_COLOR              0x8001
+#define RLVK_GL_ONE_MINUS_CONSTANT_COLOR    0x8002
+#define RLVK_GL_CONSTANT_ALPHA              0x8003
+#define RLVK_GL_ONE_MINUS_CONSTANT_ALPHA    0x8004
+#define RLVK_GL_FUNC_ADD                    0x8006
+#define RLVK_GL_MIN                         0x8007
+#define RLVK_GL_MAX                         0x8008
+#define RLVK_GL_FUNC_SUBTRACT               0x800A
+#define RLVK_GL_FUNC_REVERSE_SUBTRACT       0x800B
+
+// rlBlitFramebuffer buffer mask (GL constants)
+#define RLVK_GL_COLOR_BUFFER_BIT            0x00004000
+#define RLVK_GL_DEPTH_BUFFER_BIT            0x00000100
+
+#define RLVK_CHECK(res, msg)                                                        \
+    do {                                                                            \
+        VkResult rlvk__r = (res);                                                   \
+        if (rlvk__r != VK_SUCCESS) {                                                \
+            TRACELOG(LOG_ERROR, "RLVK: %s (VkResult %i)", msg, (int)rlvk__r);        \
+            return false;                                                           \
+        }                                                                           \
+    } while (0)
+
+//----------------------------------------------------------------------------------
+// Small math helpers (raymath conventions, kept local so rlvk stays self-contained)
+//   NOTE: MatMul(a, b) applies 'a' then 'b' (same as raymath MatrixMultiply)
+//----------------------------------------------------------------------------------
+static Matrix MatIdentity(void)
+{
+    Matrix r = { 1.0f, 0.0f, 0.0f, 0.0f,
+                 0.0f, 1.0f, 0.0f, 0.0f,
+                 0.0f, 0.0f, 1.0f, 0.0f,
+                 0.0f, 0.0f, 0.0f, 1.0f };
+    return r;
+}
+
+static Matrix MatMul(Matrix left, Matrix right)
+{
+    Matrix result;
+    result.m0  = left.m0*right.m0  + left.m1*right.m4  + left.m2*right.m8   + left.m3*right.m12;
+    result.m1  = left.m0*right.m1  + left.m1*right.m5  + left.m2*right.m9   + left.m3*right.m13;
+    result.m2  = left.m0*right.m2  + left.m1*right.m6  + left.m2*right.m10  + left.m3*right.m14;
+    result.m3  = left.m0*right.m3  + left.m1*right.m7  + left.m2*right.m11  + left.m3*right.m15;
+    result.m4  = left.m4*right.m0  + left.m5*right.m4  + left.m6*right.m8   + left.m7*right.m12;
+    result.m5  = left.m4*right.m1  + left.m5*right.m5  + left.m6*right.m9   + left.m7*right.m13;
+    result.m6  = left.m4*right.m2  + left.m5*right.m6  + left.m6*right.m10  + left.m7*right.m14;
+    result.m7  = left.m4*right.m3  + left.m5*right.m7  + left.m6*right.m11  + left.m7*right.m15;
+    result.m8  = left.m8*right.m0  + left.m9*right.m4  + left.m10*right.m8  + left.m11*right.m12;
+    result.m9  = left.m8*right.m1  + left.m9*right.m5  + left.m10*right.m9  + left.m11*right.m13;
+    result.m10 = left.m8*right.m2  + left.m9*right.m6  + left.m10*right.m10 + left.m11*right.m14;
+    result.m11 = left.m8*right.m3  + left.m9*right.m7  + left.m10*right.m11 + left.m11*right.m15;
+    result.m12 = left.m12*right.m0 + left.m13*right.m4 + left.m14*right.m8  + left.m15*right.m12;
+    result.m13 = left.m12*right.m1 + left.m13*right.m5 + left.m14*right.m9  + left.m15*right.m13;
+    result.m14 = left.m12*right.m2 + left.m13*right.m6 + left.m14*right.m10 + left.m15*right.m14;
+    result.m15 = left.m12*right.m3 + left.m13*right.m7 + left.m14*right.m11 + left.m15*right.m15;
+    return result;
+}
+
+static Matrix MatTranslate(float x, float y, float z)
+{
+    Matrix r = { 1.0f, 0.0f, 0.0f, x,
+                 0.0f, 1.0f, 0.0f, y,
+                 0.0f, 0.0f, 1.0f, z,
+                 0.0f, 0.0f, 0.0f, 1.0f };
+    return r;
+}
+
+static Matrix MatRotate(float x, float y, float z, float angleRad)
+{
+    Matrix result = MatIdentity();
+    float lengthSq = x*x + y*y + z*z;
+    if ((lengthSq != 1.0f) && (lengthSq != 0.0f))
+    {
+        float ilength = 1.0f/sqrtf(lengthSq);
+        x *= ilength; y *= ilength; z *= ilength;
+    }
+
+    float sinres = sinf(angleRad);
+    float cosres = cosf(angleRad);
+    float t = 1.0f - cosres;
+
+    result.m0 = x*x*t + cosres;    result.m4 = y*x*t + z*sinres;  result.m8  = z*x*t - y*sinres;
+    result.m1 = x*y*t - z*sinres;  result.m5 = y*y*t + cosres;    result.m9  = z*y*t + x*sinres;
+    result.m2 = x*z*t + y*sinres;  result.m6 = y*z*t - x*sinres;  result.m10 = z*z*t + cosres;
+    return result;
+}
+
+static Matrix MatScale(float x, float y, float z)
+{
+    Matrix r = { x, 0.0f, 0.0f, 0.0f,
+                 0.0f, y, 0.0f, 0.0f,
+                 0.0f, 0.0f, z, 0.0f,
+                 0.0f, 0.0f, 0.0f, 1.0f };
+    return r;
+}
+
+// GL-convention frustum (depth -1..1), matching rlgl/raymath
+static Matrix MatFrustum(double left, double right, double bottom, double top, double znear, double zfar)
+{
+    Matrix result = { 0 };
+    float rl = (float)(right - left);
+    float tb = (float)(top - bottom);
+    float fn = (float)(zfar - znear);
+
+    result.m0 = ((float)znear*2.0f)/rl;
+    result.m5 = ((float)znear*2.0f)/tb;
+    result.m8 = ((float)right + (float)left)/rl;
+    result.m9 = ((float)top + (float)bottom)/tb;
+    result.m10 = -((float)zfar + (float)znear)/fn;
+    result.m11 = -1.0f;
+    result.m14 = -((float)zfar*(float)znear*2.0f)/fn;
+    return result;
+}
+
+static Matrix MatOrtho(double left, double right, double bottom, double top, double znear, double zfar)
+{
+    Matrix result = { 0 };
+    float rl = (float)(right - left);
+    float tb = (float)(top - bottom);
+    float fn = (float)(zfar - znear);
+
+    result.m0 = 2.0f/rl;
+    result.m5 = 2.0f/tb;
+    result.m10 = -2.0f/fn;
+    result.m12 = -((float)left + (float)right)/rl;
+    result.m13 = -((float)top + (float)bottom)/tb;
+    result.m14 = -((float)zfar + (float)znear)/fn;
+    result.m15 = 1.0f;
+    return result;
+}
+
+// Write a Matrix in GPU (GLSL column-major) order: subscript order m0..m15.
+// NOTE: this is the TRANSPOSE of the struct's memory layout (which is m0,m4,m8,m12,...),
+// matching raymath's MatrixToFloatV() - a raw memcpy would upload a transposed matrix.
+static void MatToFloats(Matrix mat, float *out)
+{
+    out[0] = mat.m0;   out[1] = mat.m1;   out[2] = mat.m2;   out[3] = mat.m3;
+    out[4] = mat.m4;   out[5] = mat.m5;   out[6] = mat.m6;   out[7] = mat.m7;
+    out[8] = mat.m8;   out[9] = mat.m9;   out[10] = mat.m10; out[11] = mat.m11;
+    out[12] = mat.m12; out[13] = mat.m13; out[14] = mat.m14; out[15] = mat.m15;
+}
+
+// GL clip space -> Vulkan clip space: remap depth from [-1,1] to [0,1] and, for the
+// swapchain, flip Y (GL is y-up, Vulkan framebuffer storage is y-down).
+//
+// Render textures deliberately SKIP the Y flip: OpenGL stores FBO content bottom-up, so
+// sampling a raylib render texture yields vertically flipped content and every raylib
+// user draws it with the negative-height source idiom
+// (DrawTextureRec(rt.texture, (Rectangle){ 0, 0, w, -h }, ...)). Flipping here too would
+// double-flip and render that idiom mirrored, so FBO passes keep GL's storage order.
+static Matrix MatClipCorrection(bool flipY)
+{
+    Matrix r = MatIdentity();
+    if (flipY) r.m5 = -1.0f;
+    r.m10 = 0.5f;       // z' = 0.5*z + 0.5*w
+    r.m14 = 0.5f;
+    return r;
+}
+
+
+//----------------------------------------------------------------------------------
+// Internal types
+//----------------------------------------------------------------------------------
+typedef struct rlvkChunk {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    unsigned char *mapped;
+    VkDeviceSize size;
+    VkDeviceSize used;
+} rlvkChunk;
+
+typedef struct rlvkAlloc {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    unsigned char *ptr;
+} rlvkAlloc;
+
+typedef struct rlvkPendingCmd {
+    VkCommandBuffer cmd;
+    VkFence fence;
+} rlvkPendingCmd;
+
+typedef struct rlvkFrame {
+    VkCommandPool cmdPool;
+    VkCommandBuffer cmd;
+    VkSemaphore imageAvailable;
+    VkFence inFlight;
+
+    rlvkChunk *chunks;
+    int chunkCount;
+    int chunkCapacity;
+    int chunkCurrent;
+
+    VkDescriptorPool *descPools;
+    int descPoolCount;
+    int descPoolCapacity;
+    int descPoolCurrent;
+} rlvkFrame;
+
+typedef struct rlvkTexture {
+    bool used;
+    VkImage image;
+    VkDeviceMemory memory;
+    VkImageView view;
+    VkSampler sampler;
+    VkImageLayout layout;
+    VkFormat vkFormat;
+    VkImageAspectFlags aspect;
+    int rlFormat;              // raylib PixelFormat (0 for depth targets)
+    int width, height;
+    int mipmaps;
+    int layers;
+    bool isCubemap;
+    bool isDepth;
+    bool sampleable;           // false for depth renderbuffers (no SAMPLED usage)
+    bool ownsImage;            // false for swapchain-owned wrappers (unused today)
+    // sampler state
+    int magFilter, minFilter, wrapS, wrapT;
+    float anisotropy;
+} rlvkTexture;
+
+typedef struct rlvkFboAttachment {
+    unsigned int texId;
+    int texType;               // rlFramebufferAttachTextureType
+    int mipLevel;
+    VkImageView view;          // dedicated view (layer/mip specific), owned by the FBO
+} rlvkFboAttachment;
+
+typedef struct rlvkFramebuffer {
+    bool used;
+    rlvkFboAttachment color[4];
+    int colorCount;
+    rlvkFboAttachment depth;
+    bool hasDepth;
+    int width, height;
+    VkRenderPass passClear;
+    VkRenderPass passLoad;
+    VkFramebuffer framebuffer;
+    bool complete;
+    bool clearPending;
+    int activeDrawBuffers;
+} rlvkFramebuffer;
+
+typedef struct rlvkBuffer {
+    bool used;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    unsigned char *mapped;     // non-NULL for dynamic buffers
+    VkDeviceSize size;
+    bool dynamic;
+    bool isIndex;
+} rlvkBuffer;
+
+typedef struct rlvkUniformInfo {
+    char name[RLVK_MAX_UNIFORM_NAME];
+    unsigned int offset;
+    unsigned int arrayStride;  // 0 if not an array
+} rlvkUniformInfo;
+
+typedef struct rlvkNamedBinding {
+    char name[RLVK_MAX_UNIFORM_NAME];
+    unsigned int index;        // binding or location
+} rlvkNamedBinding;
+
+typedef struct rlvkShader {
+    bool used;
+    VkShaderModule vertModule;
+    VkShaderModule fragModule;
+    VkPipelineLayout layout;   // shared layout handle (see note [4])
+
+    rlvkUniformInfo *uniforms;
+    int uniformCount;
+    unsigned int uboSize;
+    unsigned char *uboShadow;
+
+    rlvkNamedBinding samplers[RLVK_MAX_TEXTURE_SLOTS];
+    int samplerCount;
+
+    rlvkNamedBinding attribs[16];
+    int attribCount;
+    unsigned int attribMask;   // bitmask of consumed vertex input locations
+
+    int locs[RL_MAX_SHADER_LOCATIONS];
+} rlvkShader;
+
+typedef enum {
+    RLVK_LAYOUT_BATCH = 0,     // 4 interleaved-by-block streams from the batch buffer
+    RLVK_LAYOUT_MESH = 1,      // per-attribute mesh buffers
+    RLVK_LAYOUT_MESH_INSTANCED = 2
+} rlvkVertexLayout;
+
+typedef struct rlvkPipelineKey {
+    unsigned int shaderId;
+    unsigned long long renderPass;   // VkRenderPass as integer (memcmp-safe key)
+    unsigned int topology;
+    unsigned int attribMask;         // attributes actually sourced from real buffers
+    unsigned int layoutKind;
+    unsigned int depthTest;
+    unsigned int depthMask;
+    unsigned int cullEnable;
+    unsigned int cullMode;
+    unsigned int wire;
+    unsigned int pointMode;
+    unsigned int frontFaceCCW;       // Set for FBO targets, which are not Y-flipped
+    unsigned int blendEnable;
+    unsigned int srcRGB, dstRGB, srcAlpha, dstAlpha, eqRGB, eqAlpha;
+    unsigned int colorAttachmentCount;
+} rlvkPipelineKey;
+
+typedef struct rlvkPipelineEntry {
+    rlvkPipelineKey key;
+    unsigned int keyHash;      // cached rlvkHashPipelineKey(key), used by the hash index
+    VkPipeline pipeline;
+} rlvkPipelineEntry;
+
+typedef struct rlvkSamplerEntry {
+    int magFilter, minFilter, wrapS, wrapT;
+    float anisotropy;
+    int mipLevels;
+    VkSampler sampler;
+} rlvkSamplerEntry;
+
+typedef struct rlvkDrawCall {
+    int mode;
+    int vertexCount;
+    int vertexAlignment;
+    unsigned int textureId;
+} rlvkDrawCall;
+
+typedef struct rlvkRenderBatch {
+    float *positions;          // 3 floats per vertex
+    float *texcoords;          // 2 floats per vertex
+    float *normals;            // 3 floats per vertex
+    unsigned char *colors;     // 4 bytes per vertex
+    int vertexCount;           // vertices currently in the batch
+    int elementCount;          // max quads/elements
+
+    rlvkDrawCall draws[RL_DEFAULT_BATCH_DRAWCALLS];
+    int drawCount;
+
+    float currentDepth;
+
+    VkBuffer indexBuffer;
+    VkDeviceMemory indexMemory;
+} rlvkRenderBatch;
+
+typedef struct rlvkState {
+    // Matrices
+    Matrix modelview;
+    Matrix projection;
+    Matrix transform;
+    bool transformRequired;
+    Matrix *currentMatrix;
+    int currentMatrixMode;
+    Matrix stack[RL_MAX_MATRIX_STACK_SIZE];
+    int stackCounter;
+
+    // Immediate mode
+    int currentMode;
+    float texcoordx, texcoordy;
+    float normalx, normaly, normalz;
+    unsigned char colorr, colorg, colorb, colora;
+    unsigned int currentTextureId;
+
+    // Render state
+    bool depthTest;
+    bool depthMask;
+    bool cullEnable;
+    int cullMode;              // 0 front, 1 back
+    bool wireMode;
+    bool pointMode;
+    float lineWidth;
+    bool blendEnable;
+    int blendMode;
+    unsigned int blendSrcRGB, blendDstRGB, blendSrcAlpha, blendDstAlpha, blendEqRGB, blendEqAlpha; // GL enums
+    bool scissorTest;
+    VkRect2D scissor;
+    VkViewport viewport;
+
+    float clearColor[4];
+    float clearDepth;
+
+    unsigned int currentShaderId;
+    int *currentShaderLocs;
+    unsigned int activeTextures[RLVK_MAX_TEXTURE_SLOTS];
+    int activeTextureSlot;
+    bool textureSlotOutOfRange;     // Selected slot exceeds the 4-sampler ABI: binds are ignored
+    bool samplerUnitWarned;         // One-shot log for out-of-range sampler unit indices
+
+    unsigned int activeFramebuffer;
+    unsigned int readFramebuffer;
+    bool swapchainClearPending;
+} rlvkState;
+
+typedef struct rlvkData {
+    bool ready;
+    bool initialized;
+
+    VkInstance instance;
+    VkDebugUtilsMessengerEXT debugMessenger;
+    VkSurfaceKHR surface;
+    VkPhysicalDevice physicalDevice;
+    VkPhysicalDeviceProperties deviceProps;
+    VkPhysicalDeviceMemoryProperties memProps;
+    VkPhysicalDeviceFeatures deviceFeatures;
+    bool anisotropySupported;
+    bool wireSupported;
+    bool wideLinesSupported;
+
+    VkDevice device;
+    VkQueue queue;
+    uint32_t queueFamily;
+
+    VkSwapchainKHR swapchain;
+    VkFormat swapchainFormat;
+    VkColorSpaceKHR swapchainColorSpace;
+    VkExtent2D swapchainExtent;
+    VkPresentModeKHR presentMode;
+    bool vsync;
+    uint32_t imageCount;
+    VkImage *swapchainImages;
+    VkImageView *swapchainViews;
+    VkFramebuffer *swapchainFramebuffers;
+    VkSemaphore *renderFinished;    // one per swapchain image
+    VkFence *imagesInFlight;        // borrowed fences, not owned
+
+    // Copy of the last fully rendered swapchain image, so rlReadScreenPixels() can be
+    // served between frames without touching a presentable image (which the spec forbids
+    // once it has been handed to vkQueuePresentKHR). Costs one image copy per frame.
+    VkImage captureImage;
+    VkDeviceMemory captureMemory;
+    bool captureValid;
+    bool attachmentFeedbackWarned;  // One-shot log for render-target feedback loops
+
+    VkFormat depthFormat;
+    VkImage depthImage;
+    VkDeviceMemory depthMemory;
+    VkImageView depthView;
+
+    VkRenderPass swapPassClear;
+    VkRenderPass swapPassLoad;
+
+    rlvkFrame frames[RLVK_MAX_FRAMES_IN_FLIGHT];
+    uint32_t frameIndex;
+    uint32_t imageIndex;
+    bool swapchainAcquired;         // Image acquired for the frame being recorded
+    bool acquireWaitPending;        // imageAvailable not yet consumed by a submit
+    bool swapchainPassUsed;         // A swapchain render pass ran this frame
+    uint32_t presentedImageIndex;   // Last image handed to vkQueuePresentKHR
+    VkFence presentedFence;         // Fence signaled when that frame finished rendering
+    bool hasPresented;
+    bool frameRecording;
+    bool frameSubmitted;            // a split submit already consumed imageAvailable
+    bool skipFrame;
+    bool swapchainOutOfDate;
+
+    VkCommandPool transientPool;
+    rlvkPendingCmd *pending;
+    int pendingCount;
+    int pendingCapacity;
+
+    VkDescriptorSetLayout setLayoutUBO;
+    VkDescriptorSetLayout setLayoutTextures;
+    VkPipelineLayout pipelineLayout;
+
+    rlvkPipelineEntry *pipelines;
+    int pipelineCount;
+    int pipelineCapacity;
+    int *pipelineSlots;        // hash index into pipelines[]: open addressing, -1 = empty; NULL = linear-scan fallback
+    int pipelineSlotCount;     // power of two, kept at load factor <= 3/4
+
+    rlvkSamplerEntry *samplers;
+    int samplerCount;
+    int samplerCapacity;
+
+    rlvkTexture *textures;
+    int textureCapacity;
+
+    rlvkFramebuffer *framebuffers;
+    int framebufferCapacity;
+
+    rlvkBuffer *buffers;
+    int bufferCapacity;
+
+    rlvkShader *shaders;
+    int shaderCapacity;
+
+    unsigned int defaultTextureId;
+    unsigned int defaultShaderId;
+    int defaultShaderLocs[RL_MAX_SHADER_LOCATIONS];
+
+    VkBuffer defaultAttribBuffer;   // stride-0 source for missing attributes
+    VkDeviceMemory defaultAttribMemory;
+
+    rlvkRenderBatch batch;
+    rlvkState state;
+
+    // Active render pass tracking
+    bool passActive;
+    VkRenderPass activePass;
+    unsigned int activeTargetFbo;   // 0 = swapchain
+    int targetWidth, targetHeight;
+
+    double cullDistanceNear;
+    double cullDistanceFar;
+
+    int framebufferWidth;
+    int framebufferHeight;
+} rlvkData;
+
+static rlvkData RLVK = { 0 };
+// True when the active target stores rows top-down (swapchain), false for render textures
+static bool rlvkTargetFlipsY(void)
+{
+    return (RLVK.activeTargetFbo == 0);
+}
+
+//----------------------------------------------------------------------------------
+// Forward declarations (internal)
+//----------------------------------------------------------------------------------
+static bool rlvkCreateSwapchain(int width, int height);
+static void rlvkDestroySwapchain(void);
+static void rlvkRecreateSwapchain(int width, int height);
+static void rlvkBeginRenderPass(void);
+static void rlvkEndRenderPass(void);
+static void rlvkFlushBatch(void);
+static bool rlvkSubmitFrameCommands(bool waitIdle);
+static bool rlvkEnsureRecording(void);
+static bool rlvkAcquireSwapchainImage(void);
+static void rlvkFlushBeforeDestroy(void);
+static VkSampler rlvkGetSampler(int magFilter, int minFilter, int wrapS, int wrapT, float aniso, int mipLevels);
+static void rlvkPipelineIndexRebuild(int slotCount);
+static void rlvkTransitionImage(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                                VkImageLayout oldLayout, VkImageLayout newLayout,
+                                uint32_t baseMip, uint32_t mipCount, uint32_t baseLayer, uint32_t layerCount);
+static bool rlvkReflectShader(rlvkShader *shader, const uint32_t *spirv, size_t wordCount, bool isVertex);
+static rlvkFramebuffer *rlvkGetFramebuffer(unsigned int id);
+static unsigned int rlvkPixelDataSize(int width, int height, int format);
+static VkFormat rlvkGetVkFormat(int rlFormat, VkComponentMapping *swizzle, bool *needsExpandToRGBA);
+
+//----------------------------------------------------------------------------------
+// Low-level Vulkan helpers
+//----------------------------------------------------------------------------------
+
+// Find a memory type index satisfying typeBits and properties; UINT32_MAX if none
+static uint32_t rlvkFindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties)
+{
+    for (uint32_t i = 0; i < RLVK.memProps.memoryTypeCount; i++)
+    {
+        if (((typeBits & (1u << i)) != 0) &&
+            ((RLVK.memProps.memoryTypes[i].propertyFlags & properties) == properties)) return i;
+    }
+    return UINT32_MAX;
+}
+
+// Create a VkBuffer + memory; maps it when HOST_VISIBLE is requested and mapped != NULL
+static bool rlvkCreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+                             VkBuffer *outBuffer, VkDeviceMemory *outMemory, unsigned char **mapped)
+{
+    if (size == 0) size = 16;
+
+    VkBufferCreateInfo bufferInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (vkCreateBuffer(RLVK.device, &bufferInfo, NULL, outBuffer) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to create buffer (%llu bytes)", (unsigned long long)size);
+        return false;
+    }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(RLVK.device, *outBuffer, &req);
+
+    uint32_t typeIndex = rlvkFindMemoryType(req.memoryTypeBits, props);
+    if (typeIndex == UINT32_MAX)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: No compatible memory type for buffer");
+        vkDestroyBuffer(RLVK.device, *outBuffer, NULL);
+        *outBuffer = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = typeIndex
+    };
+    if (vkAllocateMemory(RLVK.device, &allocInfo, NULL, outMemory) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to allocate buffer memory");
+        vkDestroyBuffer(RLVK.device, *outBuffer, NULL);
+        *outBuffer = VK_NULL_HANDLE;
+        return false;
+    }
+    vkBindBufferMemory(RLVK.device, *outBuffer, *outMemory, 0);
+
+    if ((mapped != NULL) && ((props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0))
+    {
+        void *ptr = NULL;
+        if (vkMapMemory(RLVK.device, *outMemory, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS)
+        {
+            TRACELOG(LOG_ERROR, "RLVK: Failed to map buffer memory");
+            vkDestroyBuffer(RLVK.device, *outBuffer, NULL);
+            vkFreeMemory(RLVK.device, *outMemory, NULL);
+            *outBuffer = VK_NULL_HANDLE;
+            *outMemory = VK_NULL_HANDLE;
+            return false;
+        }
+        *mapped = (unsigned char *)ptr;
+    }
+    else if (mapped != NULL) *mapped = NULL;
+
+    return true;
+}
+
+static void rlvkDestroyBufferObject(VkBuffer buffer, VkDeviceMemory memory, bool mapped)
+{
+    if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(RLVK.device, buffer, NULL);
+    if (memory != VK_NULL_HANDLE)
+    {
+        if (mapped) vkUnmapMemory(RLVK.device, memory);
+        vkFreeMemory(RLVK.device, memory, NULL);
+    }
+}
+
+// Begin a one-shot command buffer from the transient pool
+static VkCommandBuffer rlvkBeginOneShot(void)
+{
+    VkCommandBufferAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = RLVK.transientPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(RLVK.device, &allocInfo, &cmd) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to allocate one-shot command buffer");
+        return VK_NULL_HANDLE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    vkBeginCommandBuffer(cmd, &beginInfo);
+    return cmd;
+}
+
+// End, submit and wait for a one-shot command buffer, then free it
+static void rlvkEndOneShot(VkCommandBuffer cmd)
+{
+    if (cmd == VK_NULL_HANDLE) return;
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd
+    };
+    VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    vkCreateFence(RLVK.device, &fenceInfo, NULL, &fence);
+    vkQueueSubmit(RLVK.queue, 1, &submit, fence);
+    vkWaitForFences(RLVK.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(RLVK.device, fence, NULL);
+    vkFreeCommandBuffers(RLVK.device, RLVK.transientPool, 1, &cmd);
+}
+
+// Image layout transition covering the layouts rlvk uses; conservative stage masks
+static void rlvkTransitionImage(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                                VkImageLayout oldLayout, VkImageLayout newLayout,
+                                uint32_t baseMip, uint32_t mipCount, uint32_t baseLayer, uint32_t layerCount)
+{
+    if ((image == VK_NULL_HANDLE) || (oldLayout == newLayout)) return;
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {
+            .aspectMask = aspect,
+            .baseMipLevel = baseMip,
+            .levelCount = mipCount,
+            .baseArrayLayer = baseLayer,
+            .layerCount = layerCount
+        }
+    };
+
+    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+    switch (oldLayout)
+    {
+        case VK_IMAGE_LAYOUT_UNDEFINED: barrier.srcAccessMask = 0; srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT; break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT; break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT; break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; break;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; srcStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT; break;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: barrier.srcAccessMask = 0; srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; break;
+        default: barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; break;
+    }
+
+    switch (newLayout)
+    {
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT; break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT; dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT; break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT; dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; break;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT; break;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: barrier.dstAccessMask = 0; dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; break;
+        default: barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT; break;
+    }
+
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &barrier);
+}
+
+//----------------------------------------------------------------------------------
+// Per-frame linear buffer allocator (vertex/index/uniform scratch)
+//----------------------------------------------------------------------------------
+static bool rlvkFrameAddChunk(rlvkFrame *frame, VkDeviceSize minSize)
+{
+    VkDeviceSize size = RLVK_CHUNK_SIZE;
+    while (size < minSize) size *= 2;
+
+    if (frame->chunkCount == frame->chunkCapacity)
+    {
+        int newCapacity = (frame->chunkCapacity == 0)? 4 : frame->chunkCapacity*2;
+        rlvkChunk *newChunks = (rlvkChunk *)RL_REALLOC(frame->chunks, (size_t)newCapacity*sizeof(rlvkChunk));
+        if (newChunks == NULL) return false;
+        frame->chunks = newChunks;
+        frame->chunkCapacity = newCapacity;
+    }
+
+    rlvkChunk chunk = { 0 };
+    if (!rlvkCreateBuffer(size,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &chunk.buffer, &chunk.memory, &chunk.mapped)) return false;
+
+    chunk.size = size;
+    chunk.used = 0;
+    frame->chunks[frame->chunkCount++] = chunk;
+    return true;
+}
+
+// Sub-allocate 'size' bytes with 'alignment' from the current frame; ptr is host-visible
+static rlvkAlloc rlvkFrameAlloc(VkDeviceSize size, VkDeviceSize alignment)
+{
+    rlvkAlloc result = { VK_NULL_HANDLE, 0, NULL };
+    rlvkFrame *frame = &RLVK.frames[RLVK.frameIndex];
+    if (alignment == 0) alignment = 16;
+    if (size == 0) size = 16;
+
+    for (;;)
+    {
+        if (frame->chunkCurrent >= frame->chunkCount)
+        {
+            if (!rlvkFrameAddChunk(frame, size)) return result;
+        }
+
+        rlvkChunk *chunk = &frame->chunks[frame->chunkCurrent];
+        VkDeviceSize offset = (chunk->used + alignment - 1) & ~(alignment - 1);
+        if (offset + size <= chunk->size)
+        {
+            chunk->used = offset + size;
+            result.buffer = chunk->buffer;
+            result.offset = offset;
+            result.ptr = chunk->mapped + offset;
+            return result;
+        }
+
+        frame->chunkCurrent++;
+        if (frame->chunkCurrent >= frame->chunkCount)
+        {
+            if (!rlvkFrameAddChunk(frame, size)) return result;
+        }
+    }
+}
+
+static void rlvkFrameResetAllocator(rlvkFrame *frame)
+{
+    for (int i = 0; i < frame->chunkCount; i++) frame->chunks[i].used = 0;
+    frame->chunkCurrent = 0;
+}
+
+//----------------------------------------------------------------------------------
+// Per-frame descriptor pools
+//----------------------------------------------------------------------------------
+static bool rlvkFrameAddDescPool(rlvkFrame *frame)
+{
+    VkDescriptorPoolSize sizes[2] = {
+        { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = RLVK_DESC_SETS_PER_POOL },
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = RLVK_DESC_SETS_PER_POOL*RLVK_MAX_TEXTURE_SLOTS }
+    };
+    VkDescriptorPoolCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = RLVK_DESC_SETS_PER_POOL*2,
+        .poolSizeCount = 2,
+        .pPoolSizes = sizes
+    };
+
+    if (frame->descPoolCount == frame->descPoolCapacity)
+    {
+        int newCapacity = (frame->descPoolCapacity == 0)? 4 : frame->descPoolCapacity*2;
+        VkDescriptorPool *newPools = (VkDescriptorPool *)RL_REALLOC(frame->descPools, (size_t)newCapacity*sizeof(VkDescriptorPool));
+        if (newPools == NULL) return false;
+        frame->descPools = newPools;
+        frame->descPoolCapacity = newCapacity;
+    }
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(RLVK.device, &info, NULL, &pool) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to create descriptor pool");
+        return false;
+    }
+    frame->descPools[frame->descPoolCount++] = pool;
+    return true;
+}
+
+// Allocate one descriptor set of the given layout from the current frame pools
+static VkDescriptorSet rlvkFrameAllocDescriptorSet(VkDescriptorSetLayout layout)
+{
+    rlvkFrame *frame = &RLVK.frames[RLVK.frameIndex];
+
+    for (;;)
+    {
+        if (frame->descPoolCurrent >= frame->descPoolCount)
+        {
+            if (!rlvkFrameAddDescPool(frame)) return VK_NULL_HANDLE;
+        }
+
+        VkDescriptorSetAllocateInfo allocInfo = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = frame->descPools[frame->descPoolCurrent],
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkResult res = vkAllocateDescriptorSets(RLVK.device, &allocInfo, &set);
+        if (res == VK_SUCCESS) return set;
+        if ((res != VK_ERROR_OUT_OF_POOL_MEMORY) && (res != VK_ERROR_FRAGMENTED_POOL))
+        {
+            TRACELOG(LOG_ERROR, "RLVK: Failed to allocate descriptor set (VkResult %i)", (int)res);
+            return VK_NULL_HANDLE;
+        }
+        frame->descPoolCurrent++;
+    }
+}
+
+static void rlvkFrameResetDescPools(rlvkFrame *frame)
+{
+    for (int i = 0; i < frame->descPoolCount; i++) vkResetDescriptorPool(RLVK.device, frame->descPools[i], 0);
+    frame->descPoolCurrent = 0;
+}
+
+//----------------------------------------------------------------------------------
+// Minimal SPIR-V reflection
+//   Extracts: set0/binding0 UBO member name -> byte offset (+ total size),
+//             set1 sampler name -> binding, vertex input name -> location.
+//----------------------------------------------------------------------------------
+#define SPV_MAGIC                       0x07230203u
+
+#define SPV_OP_NAME                     5
+#define SPV_OP_MEMBER_NAME              6
+#define SPV_OP_TYPE_INT                 21
+#define SPV_OP_TYPE_FLOAT               22
+#define SPV_OP_TYPE_VECTOR              23
+#define SPV_OP_TYPE_MATRIX              24
+#define SPV_OP_TYPE_IMAGE               25
+#define SPV_OP_TYPE_SAMPLER             26
+#define SPV_OP_TYPE_SAMPLED_IMAGE       27
+#define SPV_OP_TYPE_ARRAY               28
+#define SPV_OP_TYPE_RUNTIME_ARRAY       29
+#define SPV_OP_TYPE_STRUCT              30
+#define SPV_OP_TYPE_POINTER             32
+#define SPV_OP_CONSTANT                 43
+#define SPV_OP_VARIABLE                 59
+#define SPV_OP_DECORATE                 71
+#define SPV_OP_MEMBER_DECORATE          72
+
+#define SPV_DEC_BLOCK                   2
+#define SPV_DEC_ARRAY_STRIDE            6
+#define SPV_DEC_MATRIX_STRIDE           7
+#define SPV_DEC_LOCATION                30
+#define SPV_DEC_BINDING                 33
+#define SPV_DEC_DESCRIPTOR_SET          34
+#define SPV_DEC_OFFSET                  35
+
+#define SPV_SC_UNIFORM_CONSTANT         0
+#define SPV_SC_INPUT                    1
+#define SPV_SC_UNIFORM                  2
+
+typedef struct spvId {
+    unsigned int op;
+    char name[RLVK_MAX_UNIFORM_NAME];
+    unsigned int typeId;         // pointer: pointee type; variable: pointer type
+    unsigned int storageClass;
+    int set, binding, location;
+    unsigned int width;          // int/float bit width
+    unsigned int count;          // vector components / matrix columns / array length id
+    unsigned int arrayStride;
+    unsigned int matrixStride;
+    unsigned int constant;
+    bool isConstant;
+    bool isBlock;
+} spvId;
+
+typedef struct spvMember {
+    unsigned int structId;
+    unsigned int index;
+    unsigned int offset;
+    unsigned int typeId;
+    bool hasOffset;
+    char name[RLVK_MAX_UNIFORM_NAME];
+} spvMember;
+
+typedef struct spvMemberList {
+    spvMember *items;
+    int count;
+    int capacity;
+} spvMemberList;
+
+// Find (or create) the record for member 'index' of struct 'structId'
+static spvMember *spvFindOrAddMember(spvMemberList *list, unsigned int structId, unsigned int index)
+{
+    for (int i = 0; i < list->count; i++)
+    {
+        if ((list->items[i].structId == structId) && (list->items[i].index == index)) return &list->items[i];
+    }
+
+    if (list->count == list->capacity)
+    {
+        int newCapacity = (list->capacity == 0)? 32 : list->capacity*2;
+        spvMember *grown = (spvMember *)RL_REALLOC(list->items, (size_t)newCapacity*sizeof(spvMember));
+        if (grown == NULL) return NULL;
+        list->items = grown;
+        list->capacity = newCapacity;
+    }
+
+    spvMember *entry = &list->items[list->count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->structId = structId;
+    entry->index = index;
+    return entry;
+}
+
+// Copy a SPIR-V literal string (packed words) into dst
+static void spvCopyString(const uint32_t *words, unsigned int wordCount, char *dst, size_t dstSize)
+{
+    size_t di = 0;
+    for (unsigned int w = 0; w < wordCount; w++)
+    {
+        for (int b = 0; b < 4; b++)
+        {
+            char c = (char)((words[w] >> (b*8)) & 0xFF);
+            if (c == '\0') { dst[(di < dstSize)? di : dstSize - 1] = '\0'; return; }
+            if (di < dstSize - 1) dst[di++] = c;
+        }
+    }
+    dst[di] = '\0';
+}
+
+static unsigned int spvTypeSize(const spvId *ids, unsigned int bound, unsigned int id, int depth);
+
+// Struct size = max(memberOffset + memberSize), rounded up to 16 (std140)
+static unsigned int spvStructSize(const spvId *ids, unsigned int bound, const spvMember *members, int memberCount,
+                                  unsigned int structId, int depth)
+{
+    unsigned int size = 0;
+    for (int i = 0; i < memberCount; i++)
+    {
+        if (members[i].structId != structId) continue;
+        if (!members[i].hasOffset) continue;
+
+        unsigned int memberSize = spvTypeSize(ids, bound, members[i].typeId, depth + 1);
+        if (memberSize == 0) memberSize = 16;   // conservative default for unknown types
+        unsigned int end = members[i].offset + memberSize;
+        size = (end > size)? end : size;
+    }
+    return (size + 15u) & ~15u;
+}
+
+static unsigned int spvTypeSize(const spvId *ids, unsigned int bound, unsigned int id, int depth)
+{
+    if ((id == 0) || (id >= bound) || (depth > 8)) return 0;
+    const spvId *t = &ids[id];
+    switch (t->op)
+    {
+        case SPV_OP_TYPE_INT:
+        case SPV_OP_TYPE_FLOAT: return (t->width == 0)? 4u : t->width/8u;
+        case SPV_OP_TYPE_VECTOR: return t->count*spvTypeSize(ids, bound, t->typeId, depth + 1);
+        case SPV_OP_TYPE_MATRIX: return t->count*((t->matrixStride != 0)? t->matrixStride : 16u);
+        case SPV_OP_TYPE_ARRAY:
+        {
+            unsigned int len = 1;
+            if ((t->count < bound) && ids[t->count].isConstant) len = ids[t->count].constant;
+            unsigned int stride = (t->arrayStride != 0)? t->arrayStride : spvTypeSize(ids, bound, t->typeId, depth + 1);
+            return len*stride;
+        }
+        case SPV_OP_TYPE_POINTER: return spvTypeSize(ids, bound, t->typeId, depth + 1);
+        default: return 0;
+    }
+}
+
+// Add a reflected UBO member; duplicates (same name in both stages) are ignored
+// Conventional name of a vertex input location (shader ABI, see rlvk.h)
+static const char *rlvkAttribConventionalName(unsigned int location)
+{
+    switch (location)
+    {
+        case RLVK_LOC_POSITION: return "vertexPosition";
+        case RLVK_LOC_TEXCOORD: return "vertexTexCoord";
+        case RLVK_LOC_NORMAL: return "vertexNormal";
+        case RLVK_LOC_COLOR: return "vertexColor";
+        case RLVK_LOC_TANGENT: return "vertexTangent";
+        case RLVK_LOC_TEXCOORD2: return "vertexTexCoord2";
+        case RLVK_LOC_BONEIDS: return "vertexBoneIds";
+        case RLVK_LOC_BONEWEIGHTS: return "vertexBoneWeights";
+        case RLVK_LOC_INSTANCE: return "instanceTransform";
+        default: return NULL;
+    }
+}
+
+// Conventional name of a set 1 sampler binding (texture0..texture3)
+static const char *rlvkSamplerConventionalName(unsigned int binding)
+{
+    switch (binding)
+    {
+        case 0: return "texture0";
+        case 1: return "texture1";
+        case 2: return "texture2";
+        case 3: return "texture3";
+        default: return NULL;
+    }
+}
+
+static bool rlvkShaderAddUniform(rlvkShader *shader, const char *name, unsigned int offset, unsigned int arrayStride)
+{
+    for (int i = 0; i < shader->uniformCount; i++)
+    {
+        if (strcmp(shader->uniforms[i].name, name) == 0) return true;
+    }
+
+    rlvkUniformInfo *grown = (rlvkUniformInfo *)RL_REALLOC(shader->uniforms, (size_t)(shader->uniformCount + 1)*sizeof(rlvkUniformInfo));
+    if (grown == NULL) return false;
+    shader->uniforms = grown;
+
+    rlvkUniformInfo *entry = &shader->uniforms[shader->uniformCount++];
+    memset(entry, 0, sizeof(*entry));
+    strncpy(entry->name, name, RLVK_MAX_UNIFORM_NAME - 1);
+    entry->offset = offset;
+    entry->arrayStride = arrayStride;
+    return true;
+}
+
+// Parse a SPIR-V module and fill the shader reflection tables; isVertex enables input parsing
+static bool rlvkReflectShader(rlvkShader *shader, const uint32_t *spirv, size_t wordCount, bool isVertex)
+{
+    if ((spirv == NULL) || (wordCount < 5) || (spirv[0] != SPV_MAGIC)) return false;
+
+    unsigned int bound = spirv[3];
+    if ((bound == 0) || (bound > 1000000u)) return false;
+
+    spvId *ids = (spvId *)RL_CALLOC(bound, sizeof(spvId));
+    if (ids == NULL) return false;
+    for (unsigned int i = 0; i < bound; i++) { ids[i].set = -1; ids[i].binding = -1; ids[i].location = -1; }
+
+    spvMemberList memberList = { NULL, 0, 0 };
+
+    size_t offset = 5;
+    while (offset < wordCount)
+    {
+        unsigned int word = spirv[offset];
+        unsigned int opcode = word & 0xFFFFu;
+        unsigned int length = word >> 16;
+        if ((length == 0) || (offset + length > wordCount)) break;
+        const uint32_t *ops = &spirv[offset + 1];
+        unsigned int opCount = length - 1;
+
+        switch (opcode)
+        {
+            case SPV_OP_NAME:
+            {
+                if ((opCount >= 2) && (ops[0] < bound)) spvCopyString(&ops[1], opCount - 1, ids[ops[0]].name, RLVK_MAX_UNIFORM_NAME);
+            } break;
+            case SPV_OP_MEMBER_NAME:
+            {
+                if (opCount >= 3)
+                {
+                    spvMember *entry = spvFindOrAddMember(&memberList, ops[0], ops[1]);
+                    if (entry != NULL) spvCopyString(&ops[2], opCount - 2, entry->name, RLVK_MAX_UNIFORM_NAME);
+                }
+            } break;
+            case SPV_OP_DECORATE:
+            {
+                if ((opCount >= 2) && (ops[0] < bound))
+                {
+                    spvId *target = &ids[ops[0]];
+                    unsigned int decoration = ops[1];
+                    if ((decoration == SPV_DEC_BINDING) && (opCount >= 3)) target->binding = (int)ops[2];
+                    else if ((decoration == SPV_DEC_DESCRIPTOR_SET) && (opCount >= 3)) target->set = (int)ops[2];
+                    else if ((decoration == SPV_DEC_LOCATION) && (opCount >= 3)) target->location = (int)ops[2];
+                    else if ((decoration == SPV_DEC_ARRAY_STRIDE) && (opCount >= 3)) target->arrayStride = ops[2];
+                    else if (decoration == SPV_DEC_BLOCK) target->isBlock = true;
+                }
+            } break;
+            case SPV_OP_MEMBER_DECORATE:
+            {
+                if ((opCount >= 4) && (ops[2] == SPV_DEC_OFFSET))
+                {
+                    spvMember *entry = spvFindOrAddMember(&memberList, ops[0], ops[1]);
+                    if (entry != NULL)
+                    {
+                        entry->offset = ops[3];
+                        entry->hasOffset = true;
+                    }
+                }
+                else if ((opCount >= 4) && (ops[2] == SPV_DEC_MATRIX_STRIDE) && (ops[0] < bound))
+                {
+                    ids[ops[0]].matrixStride = ops[3];
+                }
+            } break;
+            case SPV_OP_TYPE_INT:
+            case SPV_OP_TYPE_FLOAT:
+            {
+                if ((opCount >= 2) && (ops[0] < bound)) { ids[ops[0]].op = opcode; ids[ops[0]].width = ops[1]; }
+            } break;
+            case SPV_OP_TYPE_VECTOR:
+            case SPV_OP_TYPE_MATRIX:
+            {
+                if ((opCount >= 3) && (ops[0] < bound))
+                {
+                    ids[ops[0]].op = opcode;
+                    ids[ops[0]].typeId = ops[1];
+                    ids[ops[0]].count = ops[2];
+                }
+            } break;
+            case SPV_OP_TYPE_ARRAY:
+            {
+                if ((opCount >= 3) && (ops[0] < bound))
+                {
+                    ids[ops[0]].op = opcode;
+                    ids[ops[0]].typeId = ops[1];
+                    ids[ops[0]].count = ops[2];      // length constant id
+                }
+            } break;
+            case SPV_OP_TYPE_STRUCT:
+            {
+                if ((opCount >= 1) && (ops[0] < bound))
+                {
+                    ids[ops[0]].op = opcode;
+                    for (unsigned int m = 1; m < opCount; m++)
+                    {
+                        spvMember *entry = spvFindOrAddMember(&memberList, ops[0], m - 1);
+                        if (entry != NULL) entry->typeId = ops[m];
+                    }
+                }
+            } break;
+            case SPV_OP_TYPE_IMAGE:
+            case SPV_OP_TYPE_SAMPLER:
+            case SPV_OP_TYPE_SAMPLED_IMAGE:
+            case SPV_OP_TYPE_RUNTIME_ARRAY:
+            {
+                if ((opCount >= 1) && (ops[0] < bound))
+                {
+                    ids[ops[0]].op = opcode;
+                    if ((opcode == SPV_OP_TYPE_SAMPLED_IMAGE) && (opCount >= 2)) ids[ops[0]].typeId = ops[1];
+                }
+            } break;
+            case SPV_OP_TYPE_POINTER:
+            {
+                if ((opCount >= 3) && (ops[0] < bound))
+                {
+                    ids[ops[0]].op = opcode;
+                    ids[ops[0]].storageClass = ops[1];
+                    ids[ops[0]].typeId = ops[2];
+                }
+            } break;
+            case SPV_OP_CONSTANT:
+            {
+                if ((opCount >= 3) && (ops[1] < bound))
+                {
+                    ids[ops[1]].isConstant = true;
+                    ids[ops[1]].constant = ops[2];
+                }
+            } break;
+            case SPV_OP_VARIABLE:
+            {
+                if ((opCount >= 3) && (ops[1] < bound))
+                {
+                    ids[ops[1]].op = opcode;
+                    ids[ops[1]].typeId = ops[0];
+                    ids[ops[1]].storageClass = ops[2];
+                }
+            } break;
+            default: break;
+        }
+
+        offset += length;
+    }
+
+    // Walk variables and build the reflection tables
+    for (unsigned int id = 0; id < bound; id++)
+    {
+        const spvId *var = &ids[id];
+        if (var->op != SPV_OP_VARIABLE) continue;
+
+        unsigned int pointerType = var->typeId;
+        unsigned int pointee = ((pointerType < bound) && (ids[pointerType].op == SPV_OP_TYPE_POINTER))? ids[pointerType].typeId : 0;
+
+        if ((var->storageClass == SPV_SC_UNIFORM) && (var->set == 0) && (var->binding == 0) && (pointee != 0))
+        {
+            unsigned int structSize = spvStructSize(ids, bound, memberList.items, memberList.count, pointee, 0);
+            for (int i = 0; i < memberList.count; i++)
+            {
+                const spvMember *member = &memberList.items[i];
+                if (member->structId != pointee) continue;
+                if (!member->hasOffset) continue;
+                // glslc -O strips OpMemberName: fall back to the documented ABI,
+                // where the first UBO member is colDiffuse
+                const char *memberName = member->name;
+                if (memberName[0] == '\0')
+                {
+                    if (member->offset != 0) continue;
+                    memberName = "colDiffuse";
+                }
+
+                unsigned int arrayStride = 0;
+                if ((member->typeId != 0) && (member->typeId < bound) && (ids[member->typeId].op == SPV_OP_TYPE_ARRAY))
+                {
+                    arrayStride = ids[member->typeId].arrayStride;
+                    if (arrayStride == 0) arrayStride = spvTypeSize(ids, bound, ids[member->typeId].typeId, 0);
+                }
+                rlvkShaderAddUniform(shader, memberName, member->offset, arrayStride);
+            }
+            if (structSize > shader->uboSize) shader->uboSize = structSize;
+        }
+        else if ((var->storageClass == SPV_SC_UNIFORM_CONSTANT) && (pointee != 0) &&
+                 ((ids[pointee].op == SPV_OP_TYPE_SAMPLED_IMAGE) || (ids[pointee].op == SPV_OP_TYPE_IMAGE)))
+        {
+            const char *samplerName = var->name;
+            if ((samplerName[0] == '\0') && (var->binding >= 0))
+            {
+                samplerName = rlvkSamplerConventionalName((unsigned int)var->binding);
+            }
+
+            bool duplicate = false;
+            for (int i = 0; i < shader->samplerCount; i++)
+            {
+                if (strcmp(shader->samplers[i].name, (samplerName != NULL)? samplerName : "") == 0) { duplicate = true; break; }
+            }
+            if (!duplicate && (samplerName != NULL) && (var->binding >= 0) && (var->binding < RLVK_MAX_TEXTURE_SLOTS) &&
+                (shader->samplerCount < RLVK_MAX_TEXTURE_SLOTS))
+            {
+                rlvkNamedBinding *entry = &shader->samplers[shader->samplerCount++];
+                memset(entry, 0, sizeof(*entry));
+                strncpy(entry->name, samplerName, RLVK_MAX_UNIFORM_NAME - 1);
+                entry->index = (unsigned int)var->binding;
+            }
+        }
+        else if (isVertex && (var->storageClass == SPV_SC_INPUT) && (var->location >= 0))
+        {
+            const char *attribName = var->name;
+            if (attribName[0] == '\0') attribName = rlvkAttribConventionalName((unsigned int)var->location);
+            if ((attribName != NULL) && (shader->attribCount < 16))
+            {
+                rlvkNamedBinding *entry = &shader->attribs[shader->attribCount++];
+                memset(entry, 0, sizeof(*entry));
+                strncpy(entry->name, attribName, RLVK_MAX_UNIFORM_NAME - 1);
+                entry->index = (unsigned int)var->location;
+            }
+            if (var->location < 32) shader->attribMask |= (1u << var->location);
+            // A mat4 input occupies 4 consecutive locations
+            if ((pointee != 0) && (ids[pointee].op == SPV_OP_TYPE_MATRIX))
+            {
+                for (unsigned int c = 0; c < ids[pointee].count; c++)
+                {
+                    unsigned int loc = (unsigned int)var->location + c;
+                    if (loc < 32) shader->attribMask |= (1u << loc);
+                }
+            }
+        }
+    }
+
+    RL_FREE(ids);
+    RL_FREE(memberList.items);
+    return true;
+}
+
+//----------------------------------------------------------------------------------
+// Pixel formats
+//----------------------------------------------------------------------------------
+
+// Bits per pixel of a raylib PixelFormat (block formats: average bits per pixel)
+static int rlvkPixelBpp(int format)
+{
+    switch (format)
+    {
+        case PIXELFORMAT_UNCOMPRESSED_GRAYSCALE: return 8;
+        case PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA:
+        case PIXELFORMAT_UNCOMPRESSED_R5G6B5:
+        case PIXELFORMAT_UNCOMPRESSED_R5G5B5A1:
+        case PIXELFORMAT_UNCOMPRESSED_R4G4B4A4: return 16;
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8A8: return 32;
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8: return 24;
+        case PIXELFORMAT_UNCOMPRESSED_R32: return 32;
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32: return 32*3;
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32A32: return 32*4;
+        case PIXELFORMAT_UNCOMPRESSED_R16: return 16;
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16: return 16*3;
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16A16: return 16*4;
+        case PIXELFORMAT_COMPRESSED_DXT1_RGB:
+        case PIXELFORMAT_COMPRESSED_DXT1_RGBA:
+        case PIXELFORMAT_COMPRESSED_ETC1_RGB:
+        case PIXELFORMAT_COMPRESSED_ETC2_RGB:
+        case PIXELFORMAT_COMPRESSED_PVRT_RGB:
+        case PIXELFORMAT_COMPRESSED_PVRT_RGBA: return 4;
+        case PIXELFORMAT_COMPRESSED_DXT3_RGBA:
+        case PIXELFORMAT_COMPRESSED_DXT5_RGBA:
+        case PIXELFORMAT_COMPRESSED_ETC2_EAC_RGBA:
+        case PIXELFORMAT_COMPRESSED_ASTC_4x4_RGBA: return 8;
+        case PIXELFORMAT_COMPRESSED_ASTC_8x8_RGBA: return 2;
+        default: return 0;
+    }
+}
+
+static bool rlvkIsCompressedFormat(int format)
+{
+    return (format >= PIXELFORMAT_COMPRESSED_DXT1_RGB);
+}
+
+// Byte size of one mip level of the given raylib format (matches raylib GetPixelDataSize)
+static unsigned int rlvkPixelDataSize(int width, int height, int format)
+{
+    if ((width <= 0) || (height <= 0)) return 0;
+
+    int bpp = rlvkPixelBpp(format);
+    if (bpp == 0) return 0;
+
+    double size = (double)width*(double)height*(double)bpp/8.0;
+
+    if (rlvkIsCompressedFormat(format))
+    {
+        int blockW = 4, blockH = 4;
+        if (format == PIXELFORMAT_COMPRESSED_ASTC_8x8_RGBA) { blockW = 8; blockH = 8; }
+        if ((format == PIXELFORMAT_COMPRESSED_PVRT_RGB) || (format == PIXELFORMAT_COMPRESSED_PVRT_RGBA)) { blockW = 8; blockH = 4; }
+
+        if ((width % blockW) != 0) size += (double)(blockW - (width % blockW))*(double)height*(double)bpp/8.0;
+        if ((height % blockH) != 0) size += (double)((width + blockW - 1)/blockW*blockW)*(double)(blockH - (height % blockH))*(double)bpp/8.0;
+    }
+
+    return (unsigned int)size;
+}
+
+// Map raylib PixelFormat -> VkFormat, with optional component swizzle and RGB->RGBA expansion flag
+static VkFormat rlvkGetVkFormat(int rlFormat, VkComponentMapping *swizzle, bool *needsExpandToRGBA)
+{
+    VkComponentMapping identity = {
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY
+    };
+    if (swizzle != NULL) *swizzle = identity;
+    if (needsExpandToRGBA != NULL) *needsExpandToRGBA = false;
+
+    switch (rlFormat)
+    {
+        case PIXELFORMAT_UNCOMPRESSED_GRAYSCALE:
+        {
+            if (swizzle != NULL)
+            {
+                swizzle->r = VK_COMPONENT_SWIZZLE_R; swizzle->g = VK_COMPONENT_SWIZZLE_R;
+                swizzle->b = VK_COMPONENT_SWIZZLE_R; swizzle->a = VK_COMPONENT_SWIZZLE_ONE;
+            }
+            return VK_FORMAT_R8_UNORM;
+        }
+        case PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA:
+        {
+            if (swizzle != NULL)
+            {
+                swizzle->r = VK_COMPONENT_SWIZZLE_R; swizzle->g = VK_COMPONENT_SWIZZLE_R;
+                swizzle->b = VK_COMPONENT_SWIZZLE_R; swizzle->a = VK_COMPONENT_SWIZZLE_G;
+            }
+            return VK_FORMAT_R8G8_UNORM;
+        }
+        case PIXELFORMAT_UNCOMPRESSED_R5G6B5: return VK_FORMAT_R5G6B5_UNORM_PACK16;
+        case PIXELFORMAT_UNCOMPRESSED_R5G5B5A1: return VK_FORMAT_R5G5B5A1_UNORM_PACK16;
+        case PIXELFORMAT_UNCOMPRESSED_R4G4B4A4: return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8:
+        {
+            // RGB8 support is spotty; always expanded to RGBA8 on upload
+            if (needsExpandToRGBA != NULL) *needsExpandToRGBA = true;
+            return VK_FORMAT_R8G8B8A8_UNORM;
+        }
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8A8: return VK_FORMAT_R8G8B8A8_UNORM;
+        case PIXELFORMAT_UNCOMPRESSED_R32: return VK_FORMAT_R32_SFLOAT;
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32:
+        {
+            if (needsExpandToRGBA != NULL) *needsExpandToRGBA = true;
+            return VK_FORMAT_R32G32B32A32_SFLOAT;
+        }
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32A32: return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case PIXELFORMAT_UNCOMPRESSED_R16: return VK_FORMAT_R16_SFLOAT;
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16:
+        {
+            if (needsExpandToRGBA != NULL) *needsExpandToRGBA = true;
+            return VK_FORMAT_R16G16B16A16_SFLOAT;
+        }
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16A16: return VK_FORMAT_R16G16B16A16_SFLOAT;
+        case PIXELFORMAT_COMPRESSED_DXT1_RGB: return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_DXT1_RGBA: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_DXT3_RGBA: return VK_FORMAT_BC2_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_DXT5_RGBA: return VK_FORMAT_BC3_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_ETC1_RGB:
+        case PIXELFORMAT_COMPRESSED_ETC2_RGB: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_ETC2_EAC_RGBA: return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_PVRT_RGB: return VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG;
+        case PIXELFORMAT_COMPRESSED_PVRT_RGBA: return VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG;
+        case PIXELFORMAT_COMPRESSED_ASTC_4x4_RGBA: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+        case PIXELFORMAT_COMPRESSED_ASTC_8x8_RGBA: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+const char *rlGetPixelFormatName(unsigned int format)
+{
+    switch (format)
+    {
+        case PIXELFORMAT_UNCOMPRESSED_GRAYSCALE: return "GRAYSCALE";
+        case PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA: return "GRAY_ALPHA";
+        case PIXELFORMAT_UNCOMPRESSED_R5G6B5: return "R5G6B5";
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8: return "R8G8B8";
+        case PIXELFORMAT_UNCOMPRESSED_R5G5B5A1: return "R5G5B5A1";
+        case PIXELFORMAT_UNCOMPRESSED_R4G4B4A4: return "R4G4B4A4";
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8A8: return "R8G8B8A8";
+        case PIXELFORMAT_UNCOMPRESSED_R32: return "R32";
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32: return "R32G32B32";
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32A32: return "R32G32B32A32";
+        case PIXELFORMAT_UNCOMPRESSED_R16: return "R16";
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16: return "R16G16B16";
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16A16: return "R16G16B16A16";
+        case PIXELFORMAT_COMPRESSED_DXT1_RGB: return "DXT1_RGB";
+        case PIXELFORMAT_COMPRESSED_DXT1_RGBA: return "DXT1_RGBA";
+        case PIXELFORMAT_COMPRESSED_DXT3_RGBA: return "DXT3_RGBA";
+        case PIXELFORMAT_COMPRESSED_DXT5_RGBA: return "DXT5_RGBA";
+        case PIXELFORMAT_COMPRESSED_ETC1_RGB: return "ETC1_RGB";
+        case PIXELFORMAT_COMPRESSED_ETC2_RGB: return "ETC2_RGB";
+        case PIXELFORMAT_COMPRESSED_ETC2_EAC_RGBA: return "ETC2_RGBA";
+        case PIXELFORMAT_COMPRESSED_PVRT_RGB: return "PVRT_RGB";
+        case PIXELFORMAT_COMPRESSED_PVRT_RGBA: return "PVRT_RGBA";
+        case PIXELFORMAT_COMPRESSED_ASTC_4x4_RGBA: return "ASTC_4x4_RGBA";
+        case PIXELFORMAT_COMPRESSED_ASTC_8x8_RGBA: return "ASTC_8x8_RGBA";
+        default: return "UNKNOWN";
+    }
+}
+
+void rlGetGlTextureFormats(int format, unsigned int *glInternalFormat, unsigned int *glFormat, unsigned int *glType)
+{
+    // No OpenGL here: the VkFormat is reported through glInternalFormat, others are zeroed
+    if (glInternalFormat != NULL) *glInternalFormat = (unsigned int)rlvkGetVkFormat(format, NULL, NULL);
+    if (glFormat != NULL) *glFormat = 0;
+    if (glType != NULL) *glType = 0;
+}
+
+// Expand 3-component pixel data to 4 components (RGB8/RGB16F/RGB32F -> RGBA); dst must fit
+static void rlvkExpandPixels(const void *src, int width, int height, int format, void *dst)
+{
+    int count = width*height;
+    if (format == PIXELFORMAT_UNCOMPRESSED_R8G8B8)
+    {
+        const unsigned char *s = (const unsigned char *)src;
+        unsigned char *d = (unsigned char *)dst;
+        for (int i = 0; i < count; i++)
+        {
+            d[i*4 + 0] = s[i*3 + 0];
+            d[i*4 + 1] = s[i*3 + 1];
+            d[i*4 + 2] = s[i*3 + 2];
+            d[i*4 + 3] = 255;
+        }
+    }
+    else if (format == PIXELFORMAT_UNCOMPRESSED_R32G32B32)
+    {
+        const float *s = (const float *)src;
+        float *d = (float *)dst;
+        for (int i = 0; i < count; i++)
+        {
+            d[i*4 + 0] = s[i*3 + 0];
+            d[i*4 + 1] = s[i*3 + 1];
+            d[i*4 + 2] = s[i*3 + 2];
+            d[i*4 + 3] = 1.0f;
+        }
+    }
+    else if (format == PIXELFORMAT_UNCOMPRESSED_R16G16B16)
+    {
+        const unsigned short *s = (const unsigned short *)src;
+        unsigned short *d = (unsigned short *)dst;
+        for (int i = 0; i < count; i++)
+        {
+            d[i*4 + 0] = s[i*3 + 0];
+            d[i*4 + 1] = s[i*3 + 1];
+            d[i*4 + 2] = s[i*3 + 2];
+            d[i*4 + 3] = 0x3C00;    // half float 1.0
+        }
+    }
+}
+
+// Byte size of one pixel in the VkFormat actually used for storage
+static unsigned int rlvkStoredPixelSize(int rlFormat)
+{
+    switch (rlFormat)
+    {
+        case PIXELFORMAT_UNCOMPRESSED_R8G8B8: return 4;
+        case PIXELFORMAT_UNCOMPRESSED_R32G32B32: return 16;
+        case PIXELFORMAT_UNCOMPRESSED_R16G16B16: return 8;
+        default: return (unsigned int)(rlvkPixelBpp(rlFormat)/8);
+    }
+}
+
+static unsigned int rlvkStoredDataSize(int width, int height, int rlFormat)
+{
+    bool expand = false;
+    rlvkGetVkFormat(rlFormat, NULL, &expand);
+    if (!expand) return rlvkPixelDataSize(width, height, rlFormat);
+    return (unsigned int)(width*height)*rlvkStoredPixelSize(rlFormat);
+}
+
+//----------------------------------------------------------------------------------
+// Sampler cache
+//----------------------------------------------------------------------------------
+static VkSamplerAddressMode rlvkGetAddressMode(int wrap)
+{
+    switch (wrap)
+    {
+        case RL_TEXTURE_WRAP_CLAMP: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        case RL_TEXTURE_WRAP_MIRROR_REPEAT: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        case RL_TEXTURE_WRAP_MIRROR_CLAMP: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    }
+}
+
+// Get (or create) a sampler for the given GL-style filter/wrap combination
+static VkSampler rlvkGetSampler(int magFilter, int minFilter, int wrapS, int wrapT, float aniso, int mipLevels)
+{
+    if (mipLevels < 1) mipLevels = 1;
+    if (!RLVK.anisotropySupported) aniso = 1.0f;
+
+    for (int i = 0; i < RLVK.samplerCount; i++)
+    {
+        rlvkSamplerEntry *entry = &RLVK.samplers[i];
+        if ((entry->magFilter == magFilter) && (entry->minFilter == minFilter) &&
+            (entry->wrapS == wrapS) && (entry->wrapT == wrapT) &&
+            (entry->anisotropy == aniso) && (entry->mipLevels == mipLevels)) return entry->sampler;
+    }
+
+    VkFilter mag = (magFilter == RL_TEXTURE_FILTER_NEAREST)? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    VkFilter min = VK_FILTER_LINEAR;
+    VkSamplerMipmapMode mipMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+
+    switch (minFilter)
+    {
+        case RL_TEXTURE_FILTER_NEAREST: min = VK_FILTER_NEAREST; mipMode = VK_SAMPLER_MIPMAP_MODE_NEAREST; break;
+        case RL_TEXTURE_FILTER_LINEAR: min = VK_FILTER_LINEAR; mipMode = VK_SAMPLER_MIPMAP_MODE_NEAREST; break;
+        case RL_TEXTURE_FILTER_MIP_NEAREST: min = VK_FILTER_NEAREST; mipMode = VK_SAMPLER_MIPMAP_MODE_NEAREST; break;
+        case RL_TEXTURE_FILTER_NEAREST_MIP_LINEAR: min = VK_FILTER_NEAREST; mipMode = VK_SAMPLER_MIPMAP_MODE_LINEAR; break;
+        case RL_TEXTURE_FILTER_LINEAR_MIP_NEAREST: min = VK_FILTER_LINEAR; mipMode = VK_SAMPLER_MIPMAP_MODE_NEAREST; break;
+        case RL_TEXTURE_FILTER_MIP_LINEAR: min = VK_FILTER_LINEAR; mipMode = VK_SAMPLER_MIPMAP_MODE_LINEAR; break;
+        default: break;
+    }
+
+    float maxAniso = aniso;
+    if (maxAniso > RLVK.deviceProps.limits.maxSamplerAnisotropy) maxAniso = RLVK.deviceProps.limits.maxSamplerAnisotropy;
+
+    VkSamplerCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = mag,
+        .minFilter = min,
+        .mipmapMode = mipMode,
+        .addressModeU = rlvkGetAddressMode(wrapS),
+        .addressModeV = rlvkGetAddressMode(wrapT),
+        .addressModeW = rlvkGetAddressMode(wrapS),
+        .mipLodBias = 0.0f,
+        .anisotropyEnable = (maxAniso > 1.0f)? VK_TRUE : VK_FALSE,
+        .maxAnisotropy = (maxAniso > 1.0f)? maxAniso : 1.0f,
+        .compareEnable = VK_FALSE,
+        .compareOp = VK_COMPARE_OP_ALWAYS,
+        .minLod = 0.0f,
+        .maxLod = (float)mipLevels,
+        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        .unnormalizedCoordinates = VK_FALSE
+    };
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    if (vkCreateSampler(RLVK.device, &info, NULL, &sampler) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "TEXTURE: Failed to create sampler");
+        return VK_NULL_HANDLE;
+    }
+
+    if (RLVK.samplerCount == RLVK.samplerCapacity)
+    {
+        int newCapacity = (RLVK.samplerCapacity == 0)? 8 : RLVK.samplerCapacity*2;
+        rlvkSamplerEntry *grown = (rlvkSamplerEntry *)RL_REALLOC(RLVK.samplers, (size_t)newCapacity*sizeof(rlvkSamplerEntry));
+        if (grown == NULL)
+        {
+            vkDestroySampler(RLVK.device, sampler, NULL);
+            return VK_NULL_HANDLE;
+        }
+        RLVK.samplers = grown;
+        RLVK.samplerCapacity = newCapacity;
+    }
+
+    rlvkSamplerEntry *entry = &RLVK.samplers[RLVK.samplerCount++];
+    entry->magFilter = magFilter;
+    entry->minFilter = minFilter;
+    entry->wrapS = wrapS;
+    entry->wrapT = wrapT;
+    entry->anisotropy = aniso;
+    entry->mipLevels = mipLevels;
+    entry->sampler = sampler;
+    return sampler;
+}
+
+//----------------------------------------------------------------------------------
+// Texture table
+//----------------------------------------------------------------------------------
+static rlvkTexture *rlvkGetTexture(unsigned int id)
+{
+    if ((id == 0) || ((int)id > RLVK.textureCapacity)) return NULL;
+    rlvkTexture *texture = &RLVK.textures[id - 1];
+    if (!texture->used) return NULL;
+    return texture;
+}
+
+// Reserve a free texture slot; returns handle (index + 1) or 0 on failure
+static unsigned int rlvkAllocTextureSlot(void)
+{
+    for (int i = 0; i < RLVK.textureCapacity; i++)
+    {
+        if (!RLVK.textures[i].used)
+        {
+            memset(&RLVK.textures[i], 0, sizeof(rlvkTexture));
+            RLVK.textures[i].used = true;
+            return (unsigned int)(i + 1);
+        }
+    }
+
+    int newCapacity = (RLVK.textureCapacity == 0)? 64 : RLVK.textureCapacity*2;
+    rlvkTexture *grown = (rlvkTexture *)RL_REALLOC(RLVK.textures, (size_t)newCapacity*sizeof(rlvkTexture));
+    if (grown == NULL) return 0;
+    memset(&grown[RLVK.textureCapacity], 0, (size_t)(newCapacity - RLVK.textureCapacity)*sizeof(rlvkTexture));
+    RLVK.textures = grown;
+
+    int index = RLVK.textureCapacity;
+    RLVK.textureCapacity = newCapacity;
+    RLVK.textures[index].used = true;
+    return (unsigned int)(index + 1);
+}
+
+static bool rlvkFormatSupportsSampling(VkFormat format)
+{
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(RLVK.physicalDevice, format, &props);
+    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+}
+
+// Create a VkImage + memory + view; layers 6 with cubemap flag makes a cubemap
+static bool rlvkCreateImage(int width, int height, int mipLevels, int layers, VkFormat format,
+                            VkImageUsageFlags usage, VkImageAspectFlags aspect, bool cubemap,
+                            const VkComponentMapping *swizzle,
+                            VkImage *outImage, VkDeviceMemory *outMemory, VkImageView *outView)
+{
+    VkImageCreateInfo imageInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .flags = cubemap? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = { (uint32_t)width, (uint32_t)height, 1 },
+        .mipLevels = (uint32_t)mipLevels,
+        .arrayLayers = (uint32_t)layers,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+    if (vkCreateImage(RLVK.device, &imageInfo, NULL, outImage) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: Failed to create image (%ix%i)", width, height);
+        return false;
+    }
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(RLVK.device, *outImage, &req);
+    uint32_t typeIndex = rlvkFindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (typeIndex == UINT32_MAX)
+    {
+        vkDestroyImage(RLVK.device, *outImage, NULL);
+        *outImage = VK_NULL_HANDLE;
+        TRACELOG(LOG_WARNING, "TEXTURE: No device-local memory type for image");
+        return false;
+    }
+
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = typeIndex
+    };
+    if (vkAllocateMemory(RLVK.device, &allocInfo, NULL, outMemory) != VK_SUCCESS)
+    {
+        vkDestroyImage(RLVK.device, *outImage, NULL);
+        *outImage = VK_NULL_HANDLE;
+        TRACELOG(LOG_WARNING, "TEXTURE: Failed to allocate image memory");
+        return false;
+    }
+    vkBindImageMemory(RLVK.device, *outImage, *outMemory, 0);
+
+    if (outView == NULL) return true;   // Copy-only images (screen capture) need no view
+
+    VkComponentMapping identity = {
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY
+    };
+
+    VkImageViewCreateInfo viewInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = *outImage,
+        .viewType = cubemap? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .components = (swizzle != NULL)? *swizzle : identity,
+        .subresourceRange = {
+            .aspectMask = aspect,
+            .baseMipLevel = 0,
+            .levelCount = (uint32_t)mipLevels,
+            .baseArrayLayer = 0,
+            .layerCount = (uint32_t)layers
+        }
+    };
+    if (vkCreateImageView(RLVK.device, &viewInfo, NULL, outView) != VK_SUCCESS)
+    {
+        vkDestroyImage(RLVK.device, *outImage, NULL);
+        vkFreeMemory(RLVK.device, *outMemory, NULL);
+        *outImage = VK_NULL_HANDLE;
+        *outMemory = VK_NULL_HANDLE;
+        TRACELOG(LOG_WARNING, "TEXTURE: Failed to create image view");
+        return false;
+    }
+    return true;
+}
+
+// Upload a full mip chain (and all layers) through a staging buffer
+static void rlvkUploadTextureData(rlvkTexture *texture, const void *data, int mipmapCount, int layers)
+{
+    if (data == NULL) return;
+
+    bool expand = false;
+    rlvkGetVkFormat(texture->rlFormat, NULL, &expand);
+
+    // Total staging size and per-region layout
+    VkDeviceSize stagingSize = 0;
+    for (int layer = 0; layer < layers; layer++)
+    {
+        int w = texture->width, h = texture->height;
+        for (int mip = 0; mip < mipmapCount; mip++)
+        {
+            stagingSize += rlvkStoredDataSize(w, h, texture->rlFormat);
+            w = (w > 1)? w/2 : 1;
+            h = (h > 1)? h/2 : 1;
+        }
+    }
+    if (stagingSize == 0) return;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    unsigned char *mapped = NULL;
+    if (!rlvkCreateBuffer(stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &stagingMemory, &mapped)) return;
+
+    VkBufferImageCopy *regions = (VkBufferImageCopy *)RL_CALLOC((size_t)(mipmapCount*layers), sizeof(VkBufferImageCopy));
+    if (regions == NULL)
+    {
+        rlvkDestroyBufferObject(staging, stagingMemory, true);
+        return;
+    }
+
+    const unsigned char *src = (const unsigned char *)data;
+    VkDeviceSize dstOffset = 0;
+    int regionCount = 0;
+
+    for (int layer = 0; layer < layers; layer++)
+    {
+        int w = texture->width, h = texture->height;
+        for (int mip = 0; mip < mipmapCount; mip++)
+        {
+            unsigned int srcSize = rlvkPixelDataSize(w, h, texture->rlFormat);
+            unsigned int dstSize = rlvkStoredDataSize(w, h, texture->rlFormat);
+
+            if (expand) rlvkExpandPixels(src, w, h, texture->rlFormat, mapped + dstOffset);
+            else memcpy(mapped + dstOffset, src, dstSize);
+
+            regions[regionCount].bufferOffset = dstOffset;
+            regions[regionCount].bufferRowLength = 0;
+            regions[regionCount].bufferImageHeight = 0;
+            regions[regionCount].imageSubresource.aspectMask = texture->aspect;
+            regions[regionCount].imageSubresource.mipLevel = (uint32_t)mip;
+            regions[regionCount].imageSubresource.baseArrayLayer = (uint32_t)layer;
+            regions[regionCount].imageSubresource.layerCount = 1;
+            regions[regionCount].imageOffset.x = 0;
+            regions[regionCount].imageOffset.y = 0;
+            regions[regionCount].imageOffset.z = 0;
+            regions[regionCount].imageExtent.width = (uint32_t)w;
+            regions[regionCount].imageExtent.height = (uint32_t)h;
+            regions[regionCount].imageExtent.depth = 1;
+            regionCount++;
+
+            dstOffset += dstSize;
+            src += srcSize;
+            w = (w > 1)? w/2 : 1;
+            h = (h > 1)? h/2 : 1;
+        }
+    }
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd != VK_NULL_HANDLE)
+    {
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, (uint32_t)mipmapCount, 0, (uint32_t)layers);
+        vkCmdCopyBufferToImage(cmd, staging, texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               (uint32_t)regionCount, regions);
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, (uint32_t)texture->mipmaps, 0, (uint32_t)layers);
+        texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        rlvkEndOneShot(cmd);
+    }
+
+    RL_FREE(regions);
+    rlvkDestroyBufferObject(staging, stagingMemory, true);
+}
+
+// Common texture creation path shared by 2D textures and cubemaps
+static unsigned int rlvkCreateTexture(const void *data, int width, int height, int format, int mipmapCount, bool cubemap)
+{
+    if ((width <= 0) || (height <= 0))
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: Invalid texture size (%ix%i)", width, height);
+        return 0;
+    }
+    if (mipmapCount < 1) mipmapCount = 1;
+
+    VkComponentMapping swizzle;
+    bool expand = false;
+    VkFormat vkFormat = rlvkGetVkFormat(format, &swizzle, &expand);
+    if (vkFormat == VK_FORMAT_UNDEFINED)
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: Unsupported pixel format (%s)", rlGetPixelFormatName((unsigned int)format));
+        return 0;
+    }
+    if (!rlvkFormatSupportsSampling(vkFormat))
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: Format %s (VkFormat %i) not supported by device, texture not created",
+                 rlGetPixelFormatName((unsigned int)format), (int)vkFormat);
+        return 0;
+    }
+
+    unsigned int id = rlvkAllocTextureSlot();
+    if (id == 0) return 0;
+
+    rlvkTexture *texture = &RLVK.textures[id - 1];
+    texture->width = width;
+    texture->height = height;
+    texture->mipmaps = mipmapCount;
+    texture->rlFormat = format;
+    texture->vkFormat = vkFormat;
+    texture->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    texture->isCubemap = cubemap;
+    texture->sampleable = true;
+    texture->layers = cubemap? 6 : 1;
+    texture->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    texture->ownsImage = true;
+    texture->magFilter = RL_TEXTURE_FILTER_NEAREST;
+    texture->minFilter = (mipmapCount > 1)? RL_TEXTURE_FILTER_MIP_NEAREST : RL_TEXTURE_FILTER_NEAREST;
+    texture->wrapS = RL_TEXTURE_WRAP_REPEAT;
+    texture->wrapT = RL_TEXTURE_WRAP_REPEAT;
+    texture->anisotropy = 1.0f;
+
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!rlvkIsCompressedFormat(format)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+    if (!rlvkCreateImage(width, height, mipmapCount, texture->layers, vkFormat, usage,
+                         VK_IMAGE_ASPECT_COLOR_BIT, cubemap, &swizzle,
+                         &texture->image, &texture->memory, &texture->view))
+    {
+        texture->used = false;
+        return 0;
+    }
+
+    texture->sampler = rlvkGetSampler(texture->magFilter, texture->minFilter, texture->wrapS, texture->wrapT,
+                                      texture->anisotropy, texture->mipmaps);
+
+    if (data != NULL) rlvkUploadTextureData(texture, data, mipmapCount, texture->layers);
+    else
+    {
+        VkCommandBuffer cmd = rlvkBeginOneShot();
+        if (cmd != VK_NULL_HANDLE)
+        {
+            rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, (uint32_t)mipmapCount, 0, (uint32_t)texture->layers);
+            texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            rlvkEndOneShot(cmd);
+        }
+    }
+
+    TRACELOG(LOG_INFO, "TEXTURE: [ID %i] Texture loaded successfully (%ix%i | %s | %i mipmaps)",
+             (int)id, width, height, rlGetPixelFormatName((unsigned int)format), mipmapCount);
+    return id;
+}
+
+unsigned int rlLoadTexture(const void *data, int width, int height, int format, int mipmapCount)
+{
+    return rlvkCreateTexture(data, width, height, format, mipmapCount, false);
+}
+
+unsigned int rlLoadTextureCubemap(const void *data, int size, int format, int mipmapCount)
+{
+    return rlvkCreateTexture(data, size, size, format, mipmapCount, true);
+}
+
+unsigned int rlLoadTextureDepth(int width, int height, bool useRenderBuffer)
+{
+    if ((width <= 0) || (height <= 0)) return 0;
+
+    unsigned int id = rlvkAllocTextureSlot();
+    if (id == 0) return 0;
+
+    rlvkTexture *texture = &RLVK.textures[id - 1];
+    texture->width = width;
+    texture->height = height;
+    texture->mipmaps = 1;
+    texture->layers = 1;
+    texture->rlFormat = 0;
+    texture->vkFormat = RLVK.depthFormat;
+    texture->aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if ((RLVK.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT) || (RLVK.depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT))
+        texture->aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    texture->isDepth = true;
+    texture->sampleable = !useRenderBuffer;
+    texture->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    texture->ownsImage = true;
+    texture->magFilter = RL_TEXTURE_FILTER_NEAREST;
+    texture->minFilter = RL_TEXTURE_FILTER_NEAREST;
+    texture->wrapS = RL_TEXTURE_WRAP_CLAMP;
+    texture->wrapT = RL_TEXTURE_WRAP_CLAMP;
+    texture->anisotropy = 1.0f;
+
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!useRenderBuffer) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+
+    if (!rlvkCreateImage(width, height, 1, 1, texture->vkFormat, usage, texture->aspect, false, NULL,
+                         &texture->image, &texture->memory, &texture->view))
+    {
+        texture->used = false;
+        return 0;
+    }
+
+    texture->sampler = rlvkGetSampler(texture->magFilter, texture->minFilter, texture->wrapS, texture->wrapT, 1.0f, 1);
+
+    // Move sampleable depth textures out of UNDEFINED right away: they may be bound to a
+    // shader before ever being rendered into, and a descriptor read of an UNDEFINED image
+    // is invalid (VUID-vkCmdDraw-None-09600)
+    if (texture->sampleable)
+    {
+        VkCommandBuffer cmd = rlvkBeginOneShot();
+        if (cmd != VK_NULL_HANDLE)
+        {
+            rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, 0, 1);
+            texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            rlvkEndOneShot(cmd);
+        }
+    }
+
+    TRACELOG(LOG_INFO, "TEXTURE: [ID %i] Depth texture loaded (%ix%i)", (int)id, width, height);
+    return id;
+}
+
+void rlUpdateTexture(unsigned int id, int offsetX, int offsetY, int width, int height, int format, const void *data)
+{
+    rlvkTexture *texture = rlvkGetTexture(id);
+    if ((texture == NULL) || (data == NULL)) return;
+    if ((width <= 0) || (height <= 0)) return;
+    if (rlvkIsCompressedFormat(format))
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Partial update not supported for compressed formats", (int)id);
+        return;
+    }
+    if (format != texture->rlFormat)
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Update format mismatch (texture %s, data %s)", (int)id,
+                 rlGetPixelFormatName((unsigned int)texture->rlFormat), rlGetPixelFormatName((unsigned int)format));
+        return;
+    }
+
+    bool expand = false;
+    rlvkGetVkFormat(format, NULL, &expand);
+    unsigned int srcSize = rlvkPixelDataSize(width, height, format);
+    unsigned int dstSize = rlvkStoredDataSize(width, height, format);
+    if ((srcSize == 0) || (dstSize == 0)) return;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    unsigned char *mapped = NULL;
+    if (!rlvkCreateBuffer(dstSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &stagingMemory, &mapped)) return;
+
+    if (expand) rlvkExpandPixels(data, width, height, format, mapped);
+    else memcpy(mapped, data, dstSize);
+
+    VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = { texture->aspect, 0, 0, 1 },
+        .imageOffset = { offsetX, offsetY, 0 },
+        .imageExtent = { (uint32_t)width, (uint32_t)height, 1 }
+    };
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd != VK_NULL_HANDLE)
+    {
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+        vkCmdCopyBufferToImage(cmd, staging, texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+        texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        rlvkEndOneShot(cmd);
+    }
+
+    rlvkDestroyBufferObject(staging, stagingMemory, true);
+}
+
+// Destroying a Vulkan object that the in-flight command buffer still references
+// invalidates that command buffer. Since recording can span arbitrary user code now
+// (render-texture passes outside BeginDrawing/EndDrawing), submit what has been recorded
+// and wait before any destruction.
+static void rlvkFlushBeforeDestroy(void)
+{
+    if (RLVK.device == VK_NULL_HANDLE) return;
+
+    if (RLVK.frameRecording)
+    {
+        rlvkFlushBatch();
+        rlvkSubmitFrameCommands(true);
+        return;
+    }
+    vkDeviceWaitIdle(RLVK.device);
+}
+
+void rlUnloadTexture(unsigned int id)
+{
+    rlvkTexture *texture = rlvkGetTexture(id);
+    if (texture == NULL) return;
+    if (id == RLVK.defaultTextureId) return;   // Default texture is owned by rlvk
+
+    rlvkFlushBeforeDestroy();
+    if (texture->view != VK_NULL_HANDLE) vkDestroyImageView(RLVK.device, texture->view, NULL);
+    if (texture->ownsImage && (texture->image != VK_NULL_HANDLE)) vkDestroyImage(RLVK.device, texture->image, NULL);
+    if (texture->memory != VK_NULL_HANDLE) vkFreeMemory(RLVK.device, texture->memory, NULL);
+    memset(texture, 0, sizeof(*texture));
+
+    for (int i = 0; i < RLVK_MAX_TEXTURE_SLOTS; i++)
+    {
+        if (RLVK.state.activeTextures[i] == id) RLVK.state.activeTextures[i] = 0;
+    }
+    if (RLVK.state.currentTextureId == id) RLVK.state.currentTextureId = RLVK.defaultTextureId;
+}
+
+// Recreate the attachment views and VkFramebuffer of every framebuffer that references
+// this texture. rlGenTextureMipmaps() replaces the VkImage, which would leave them dangling.
+static void rlvkRefreshFramebuffersUsing(unsigned int texId)
+{
+    for (int i = 0; i < RLVK.framebufferCapacity; i++)
+    {
+        rlvkFramebuffer *fbo = &RLVK.framebuffers[i];
+        if (!fbo->used || !fbo->complete) continue;
+
+        bool uses = (fbo->hasDepth && (fbo->depth.texId == texId));
+        for (int c = 0; c < fbo->colorCount; c++)
+        {
+            if (fbo->color[c].texId == texId) uses = true;
+        }
+        if (!uses) continue;
+
+        if (fbo->framebuffer != VK_NULL_HANDLE)
+        {
+            vkDestroyFramebuffer(RLVK.device, fbo->framebuffer, NULL);
+            fbo->framebuffer = VK_NULL_HANDLE;
+        }
+        for (int c = 0; c < 4; c++)
+        {
+            if (fbo->color[c].view == VK_NULL_HANDLE) continue;
+            vkDestroyImageView(RLVK.device, fbo->color[c].view, NULL);
+            fbo->color[c].view = VK_NULL_HANDLE;
+        }
+        if (fbo->depth.view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(RLVK.device, fbo->depth.view, NULL);
+            fbo->depth.view = VK_NULL_HANDLE;
+        }
+
+        fbo->complete = false;
+        rlFramebufferComplete((unsigned int)(i + 1));
+    }
+}
+
+void rlGenTextureMipmaps(unsigned int id, int width, int height, int format, int *mipmaps)
+{
+    (void)format;
+    rlvkTexture *texture = rlvkGetTexture(id);
+    if (texture == NULL) return;
+    if (rlvkIsCompressedFormat(texture->rlFormat))
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Mipmaps cannot be generated for compressed formats", (int)id);
+        return;
+    }
+
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(RLVK.physicalDevice, texture->vkFormat, &props);
+    if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) == 0)
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Format does not support linear blit, mipmaps not generated", (int)id);
+        return;
+    }
+
+    // Recreate the image when it has no mip levels yet
+    int levels = 1;
+    { int w = width, h = height; while ((w > 1) || (h > 1)) { w = (w > 1)? w/2 : 1; h = (h > 1)? h/2 : 1; levels++; } }
+
+    if (texture->mipmaps < levels)
+    {
+        // The image is about to be replaced: retire any command buffer referencing it
+        rlvkFlushBeforeDestroy();
+
+        VkComponentMapping swizzle;
+        rlvkGetVkFormat(texture->rlFormat, &swizzle, NULL);
+
+        VkImage newImage = VK_NULL_HANDLE;
+        VkDeviceMemory newMemory = VK_NULL_HANDLE;
+        VkImageView newView = VK_NULL_HANDLE;
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (!rlvkCreateImage(texture->width, texture->height, levels, texture->layers, texture->vkFormat,
+                             usage, texture->aspect, texture->isCubemap, &swizzle, &newImage, &newMemory, &newView)) return;
+
+        VkCommandBuffer cmd = rlvkBeginOneShot();
+        if (cmd == VK_NULL_HANDLE) return;
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+        rlvkTransitionImage(cmd, newImage, texture->aspect, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            0, (uint32_t)levels, 0, (uint32_t)texture->layers);
+        VkImageCopy copy = {
+            .srcSubresource = { texture->aspect, 0, 0, (uint32_t)texture->layers },
+            .dstSubresource = { texture->aspect, 0, 0, (uint32_t)texture->layers },
+            .extent = { (uint32_t)texture->width, (uint32_t)texture->height, 1 }
+        };
+        vkCmdCopyImage(cmd, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       newImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        rlvkEndOneShot(cmd);
+
+        vkDestroyImageView(RLVK.device, texture->view, NULL);
+        vkDestroyImage(RLVK.device, texture->image, NULL);
+        vkFreeMemory(RLVK.device, texture->memory, NULL);
+
+        texture->image = newImage;
+        texture->memory = newMemory;
+        texture->view = newView;
+        texture->mipmaps = levels;
+        texture->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+        rlvkRefreshFramebuffersUsing(id);
+    }
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd == VK_NULL_HANDLE) return;
+
+    // Blit chain: level i -> level i + 1
+    rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+
+    int mipWidth = texture->width;
+    int mipHeight = texture->height;
+    for (int i = 1; i < texture->mipmaps; i++)
+    {
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (uint32_t)(i - 1), 1, 0, (uint32_t)texture->layers);
+
+        int nextWidth = (mipWidth > 1)? mipWidth/2 : 1;
+        int nextHeight = (mipHeight > 1)? mipHeight/2 : 1;
+
+        VkImageBlit blit = {
+            .srcSubresource = { texture->aspect, (uint32_t)(i - 1), 0, (uint32_t)texture->layers },
+            .dstSubresource = { texture->aspect, (uint32_t)i, 0, (uint32_t)texture->layers }
+        };
+        blit.srcOffsets[1].x = mipWidth;   blit.srcOffsets[1].y = mipHeight;   blit.srcOffsets[1].z = 1;
+        blit.dstOffsets[1].x = nextWidth;  blit.dstOffsets[1].y = nextHeight;  blit.dstOffsets[1].z = 1;
+
+        vkCmdBlitImage(cmd, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+        rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, (uint32_t)(i - 1), 1, 0, (uint32_t)texture->layers);
+
+        mipWidth = nextWidth;
+        mipHeight = nextHeight;
+    }
+
+    rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, (uint32_t)(texture->mipmaps - 1), 1, 0, (uint32_t)texture->layers);
+    rlvkEndOneShot(cmd);
+
+    texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    texture->minFilter = RL_TEXTURE_FILTER_MIP_LINEAR;
+    texture->sampler = rlvkGetSampler(texture->magFilter, texture->minFilter, texture->wrapS, texture->wrapT,
+                                      texture->anisotropy, texture->mipmaps);
+    if (mipmaps != NULL) *mipmaps = texture->mipmaps;
+
+    TRACELOG(LOG_INFO, "TEXTURE: [ID %i] Mipmaps generated (%i levels)", (int)id, texture->mipmaps);
+}
+
+void *rlReadTexturePixels(unsigned int id, int width, int height, int format)
+{
+    rlvkTexture *texture = rlvkGetTexture(id);
+    if (texture == NULL) return NULL;
+    if (rlvkIsCompressedFormat(texture->rlFormat))
+    {
+        TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Cannot read pixels from compressed texture", (int)id);
+        return NULL;
+    }
+    if (width > texture->width) width = texture->width;
+    if (height > texture->height) height = texture->height;
+    if ((width <= 0) || (height <= 0)) return NULL;
+
+    unsigned int storedSize = rlvkStoredDataSize(width, height, texture->rlFormat);
+    if (storedSize == 0) return NULL;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    unsigned char *mapped = NULL;
+    if (!rlvkCreateBuffer(storedSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &stagingMemory, &mapped)) return NULL;
+
+    VkBufferImageCopy region = {
+        .imageSubresource = { texture->aspect, 0, 0, 1 },
+        .imageExtent = { (uint32_t)width, (uint32_t)height, 1 }
+    };
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd == VK_NULL_HANDLE)
+    {
+        rlvkDestroyBufferObject(staging, stagingMemory, true);
+        return NULL;
+    }
+    VkImageLayout previous = texture->layout;
+    rlvkTransitionImage(cmd, texture->image, texture->aspect, previous, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+    vkCmdCopyImageToBuffer(cmd, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &region);
+    rlvkTransitionImage(cmd, texture->image, texture->aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+    texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    rlvkEndOneShot(cmd);
+
+    void *result = NULL;
+    bool expand = false;
+    rlvkGetVkFormat(texture->rlFormat, NULL, &expand);
+
+    if (expand && (format == texture->rlFormat))
+    {
+        // Compact the stored RGBA data back to the requested 3-component layout
+        unsigned int outSize = rlvkPixelDataSize(width, height, texture->rlFormat);
+        result = RL_MALLOC(outSize);
+        if (result != NULL)
+        {
+            int pixels = width*height;
+            unsigned int componentSize = rlvkStoredPixelSize(texture->rlFormat)/4;
+            const unsigned char *src = mapped;
+            unsigned char *dst = (unsigned char *)result;
+            for (int i = 0; i < pixels; i++)
+            {
+                memcpy(dst + (size_t)i*3*componentSize, src + (size_t)i*4*componentSize, (size_t)3*componentSize);
+            }
+        }
+    }
+    else
+    {
+        result = RL_MALLOC(storedSize);
+        if (result != NULL) memcpy(result, mapped, storedSize);
+        if (format != texture->rlFormat)
+        {
+            TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Read pixels format mismatch, returning texture format %s",
+                     (int)id, rlGetPixelFormatName((unsigned int)texture->rlFormat));
+        }
+    }
+
+    rlvkDestroyBufferObject(staging, stagingMemory, true);
+    return result;
+}
+
+void rlTextureParameters(unsigned int id, int param, int value)
+{
+    rlvkTexture *texture = rlvkGetTexture(id);
+    if (texture == NULL) return;
+
+    switch (param)
+    {
+        case RL_TEXTURE_WRAP_S: texture->wrapS = value; break;
+        case RL_TEXTURE_WRAP_T: texture->wrapT = value; break;
+        case RL_TEXTURE_MAG_FILTER: texture->magFilter = value; break;
+        case RL_TEXTURE_MIN_FILTER: texture->minFilter = value; break;
+        case RL_TEXTURE_FILTER_ANISOTROPIC:
+        {
+            if (!RLVK.anisotropySupported)
+            {
+                TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Anisotropic filtering not supported", (int)id);
+                return;
+            }
+            float aniso = (float)value;
+            if (aniso > RLVK.deviceProps.limits.maxSamplerAnisotropy)
+            {
+                TRACELOG(LOG_WARNING, "TEXTURE: [ID %i] Maximum anisotropic filter level supported is %iX",
+                         (int)id, (int)RLVK.deviceProps.limits.maxSamplerAnisotropy);
+                aniso = RLVK.deviceProps.limits.maxSamplerAnisotropy;
+            }
+            texture->anisotropy = aniso;
+        } break;
+        default: return;
+    }
+
+    texture->sampler = rlvkGetSampler(texture->magFilter, texture->minFilter, texture->wrapS, texture->wrapT,
+                                      texture->anisotropy, texture->mipmaps);
+}
+
+void rlActiveTextureSlot(int slot)
+{
+    // The shader ABI exposes 4 combined image samplers (set 1, binding 0..3). Callers may
+    // walk more slots than that (rmodels binds up to MATERIAL_MAP_* 11); selecting one of
+    // those must make the following bind calls no-ops instead of clobbering the last valid
+    // slot, which would corrupt e.g. the diffuse binding
+    if ((slot < 0) || (slot >= RLVK_MAX_TEXTURE_SLOTS))
+    {
+        if (!RLVK.state.textureSlotOutOfRange)
+        {
+            TRACELOG(LOG_DEBUG, "TEXTURE: Texture slot %i out of range, only %i slots are available",
+                     slot, RLVK_MAX_TEXTURE_SLOTS);
+        }
+        RLVK.state.textureSlotOutOfRange = true;
+        return;
+    }
+
+    RLVK.state.textureSlotOutOfRange = false;
+    RLVK.state.activeTextureSlot = slot;
+}
+
+void rlEnableTexture(unsigned int id)
+{
+    if (RLVK.state.textureSlotOutOfRange) return;
+    RLVK.state.activeTextures[RLVK.state.activeTextureSlot] = id;
+}
+
+void rlDisableTexture(void)
+{
+    if (RLVK.state.textureSlotOutOfRange) return;
+    RLVK.state.activeTextures[RLVK.state.activeTextureSlot] = 0;
+}
+
+void rlEnableTextureCubemap(unsigned int id)
+{
+    if (RLVK.state.textureSlotOutOfRange) return;
+    RLVK.state.activeTextures[RLVK.state.activeTextureSlot] = id;
+}
+
+void rlDisableTextureCubemap(void)
+{
+    if (RLVK.state.textureSlotOutOfRange) return;
+    RLVK.state.activeTextures[RLVK.state.activeTextureSlot] = 0;
+}
+
+//----------------------------------------------------------------------------------
+// Shader table
+//----------------------------------------------------------------------------------
+#define RLVK_LOC_PUSH_FLAG      0x02000000   // "mvp"/"matModel" live in push constants
+
+static rlvkShader *rlvkGetShader(unsigned int id)
+{
+    if ((id == 0) || ((int)id > RLVK.shaderCapacity)) return NULL;
+    rlvkShader *shader = &RLVK.shaders[id - 1];
+    if (!shader->used) return NULL;
+    return shader;
+}
+
+static unsigned int rlvkAllocShaderSlot(void)
+{
+    for (int i = 0; i < RLVK.shaderCapacity; i++)
+    {
+        if (!RLVK.shaders[i].used)
+        {
+            memset(&RLVK.shaders[i], 0, sizeof(rlvkShader));
+            RLVK.shaders[i].used = true;
+            return (unsigned int)(i + 1);
+        }
+    }
+
+    int newCapacity = (RLVK.shaderCapacity == 0)? 16 : RLVK.shaderCapacity*2;
+    rlvkShader *grown = (rlvkShader *)RL_REALLOC(RLVK.shaders, (size_t)newCapacity*sizeof(rlvkShader));
+    if (grown == NULL) return 0;
+    memset(&grown[RLVK.shaderCapacity], 0, (size_t)(newCapacity - RLVK.shaderCapacity)*sizeof(rlvkShader));
+    RLVK.shaders = grown;
+
+    int index = RLVK.shaderCapacity;
+    RLVK.shaderCapacity = newCapacity;
+    RLVK.shaders[index].used = true;
+    return (unsigned int)(index + 1);
+}
+
+static VkShaderModule rlvkCreateShaderModule(const void *spirv, int size)
+{
+    if ((spirv == NULL) || (size < 4) || ((size % 4) != 0)) return VK_NULL_HANDLE;
+
+    VkShaderModuleCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = (size_t)size,
+        .pCode = (const uint32_t *)spirv
+    };
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(RLVK.device, &info, NULL, &module) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "SHADER: Failed to create shader module");
+        return VK_NULL_HANDLE;
+    }
+    return module;
+}
+
+// Resolve raylib's conventional shader locations after reflection
+static void rlvkResolveDefaultLocations(unsigned int shaderId)
+{
+    rlvkShader *shader = rlvkGetShader(shaderId);
+    if (shader == NULL) return;
+
+    for (int i = 0; i < RL_MAX_SHADER_LOCATIONS; i++) shader->locs[i] = -1;
+
+    shader->locs[SHADER_LOC_VERTEX_POSITION] = rlGetLocationAttrib(shaderId, "vertexPosition");
+    shader->locs[SHADER_LOC_VERTEX_TEXCOORD01] = rlGetLocationAttrib(shaderId, "vertexTexCoord");
+    shader->locs[SHADER_LOC_VERTEX_TEXCOORD02] = rlGetLocationAttrib(shaderId, "vertexTexCoord2");
+    shader->locs[SHADER_LOC_VERTEX_NORMAL] = rlGetLocationAttrib(shaderId, "vertexNormal");
+    shader->locs[SHADER_LOC_VERTEX_TANGENT] = rlGetLocationAttrib(shaderId, "vertexTangent");
+    shader->locs[SHADER_LOC_VERTEX_COLOR] = rlGetLocationAttrib(shaderId, "vertexColor");
+    shader->locs[SHADER_LOC_VERTEX_BONEIDS] = rlGetLocationAttrib(shaderId, "vertexBoneIds");
+    shader->locs[SHADER_LOC_VERTEX_BONEWEIGHTS] = rlGetLocationAttrib(shaderId, "vertexBoneWeights");
+    shader->locs[SHADER_LOC_VERTEX_INSTANCETRANSFORM] = rlGetLocationAttrib(shaderId, "instanceTransform");
+
+    shader->locs[SHADER_LOC_MATRIX_MVP] = rlGetLocationUniform(shaderId, "mvp");
+    shader->locs[SHADER_LOC_MATRIX_VIEW] = rlGetLocationUniform(shaderId, "matView");
+    shader->locs[SHADER_LOC_MATRIX_PROJECTION] = rlGetLocationUniform(shaderId, "matProjection");
+    shader->locs[SHADER_LOC_MATRIX_MODEL] = rlGetLocationUniform(shaderId, "matModel");
+    shader->locs[SHADER_LOC_MATRIX_NORMAL] = rlGetLocationUniform(shaderId, "matNormal");
+    shader->locs[SHADER_LOC_COLOR_DIFFUSE] = rlGetLocationUniform(shaderId, "colDiffuse");
+    shader->locs[SHADER_LOC_COLOR_SPECULAR] = rlGetLocationUniform(shaderId, "colSpecular");
+    shader->locs[SHADER_LOC_COLOR_AMBIENT] = rlGetLocationUniform(shaderId, "colAmbient");
+    shader->locs[SHADER_LOC_VECTOR_VIEW] = rlGetLocationUniform(shaderId, "viewPos");
+    shader->locs[SHADER_LOC_MAP_ALBEDO] = rlGetLocationUniform(shaderId, "texture0");
+    shader->locs[SHADER_LOC_MAP_METALNESS] = rlGetLocationUniform(shaderId, "texture1");
+    shader->locs[SHADER_LOC_MAP_NORMAL] = rlGetLocationUniform(shaderId, "texture2");
+}
+
+unsigned int rlLoadShaderCodeSize(const void *vsSpirv, int vsSize, const void *fsSpirv, int fsSize)
+{
+    if (!RLVK.initialized)
+    {
+        TRACELOG(LOG_WARNING, "SHADER: Cannot load shader, Vulkan device not initialized");
+        return 0;
+    }
+    // raylib semantics: a NULL stage means "use the default shader for that stage"
+    // (LoadShader(0, "foo.frag.spv") is the documented form for fragment-only shaders)
+    if ((vsSpirv == NULL) || (vsSize <= 0))
+    {
+        vsSpirv = default_vert_spv_data;
+        vsSize = (int)default_vert_spv_size;
+    }
+    if ((fsSpirv == NULL) || (fsSize <= 0))
+    {
+        fsSpirv = default_frag_spv_data;
+        fsSize = (int)default_frag_spv_size;
+    }
+
+    unsigned int id = rlvkAllocShaderSlot();
+    if (id == 0) return 0;
+
+    rlvkShader *shader = &RLVK.shaders[id - 1];
+    shader->layout = RLVK.pipelineLayout;
+    shader->vertModule = rlvkCreateShaderModule(vsSpirv, vsSize);
+    shader->fragModule = rlvkCreateShaderModule(fsSpirv, fsSize);
+    if ((shader->vertModule == VK_NULL_HANDLE) || (shader->fragModule == VK_NULL_HANDLE))
+    {
+        if (shader->vertModule != VK_NULL_HANDLE) vkDestroyShaderModule(RLVK.device, shader->vertModule, NULL);
+        if (shader->fragModule != VK_NULL_HANDLE) vkDestroyShaderModule(RLVK.device, shader->fragModule, NULL);
+        memset(shader, 0, sizeof(*shader));
+        return 0;
+    }
+
+    rlvkReflectShader(shader, (const uint32_t *)vsSpirv, (size_t)vsSize/4, true);
+    rlvkReflectShader(shader, (const uint32_t *)fsSpirv, (size_t)fsSize/4, false);
+
+    if (shader->uboSize == 0) shader->uboSize = 16;   // Keep set 0 always bindable
+    shader->uboShadow = (unsigned char *)RL_CALLOC(shader->uboSize, 1);
+    if (shader->uboShadow == NULL)
+    {
+        rlUnloadShaderProgram(id);
+        return 0;
+    }
+
+    // Uniforms are used multiplicatively far more often than additively (colDiffuse,
+    // tints, factors): default the whole block to 1.0f so an untouched UBO never
+    // annihilates the shaded result
+    {
+        float *slots = (float *)(void *)shader->uboShadow;
+        for (unsigned int i = 0; i < shader->uboSize/sizeof(float); i++) slots[i] = 1.0f;
+    }
+
+    rlvkResolveDefaultLocations(id);
+
+    // Default colDiffuse to white so untouched shaders draw as raylib expects
+    int colDiffuse = shader->locs[SHADER_LOC_COLOR_DIFFUSE];
+    if ((colDiffuse >= 0) && ((colDiffuse + 16) <= (int)shader->uboSize))
+    {
+        float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        memcpy(shader->uboShadow + colDiffuse, white, sizeof(white));
+    }
+
+    TRACELOG(LOG_INFO, "SHADER: [ID %i] Shader program loaded successfully (UBO %u bytes, %i samplers, %i attributes)",
+             (int)id, shader->uboSize, shader->samplerCount, shader->attribCount);
+    return id;
+}
+
+unsigned int rlLoadShaderCode(const char *vsCode, const char *fsCode)
+{
+    // The char* variant only supports SPIR-V blobs; sizes are unknown so the caller
+    // must use rlLoadShaderCodeSize() for anything but NULL (default shader) input
+    if ((vsCode == NULL) && (fsCode == NULL)) return RLVK.defaultShaderId;
+
+    const uint32_t *vsWords = (const uint32_t *)(const void *)vsCode;
+    const uint32_t *fsWords = (const uint32_t *)(const void *)fsCode;
+    if ((vsCode == NULL) || (fsCode == NULL) || (vsWords[0] != SPV_MAGIC) || (fsWords[0] != SPV_MAGIC))
+    {
+        TRACELOG(LOG_ERROR, "SHADER: GLSL source is not supported at runtime, provide SPIR-V (compile with glslc)");
+        return 0;
+    }
+
+    TRACELOG(LOG_ERROR, "SHADER: SPIR-V blob size unknown, use rlLoadShaderCodeSize()");
+    return 0;
+}
+
+void rlUnloadShaderProgram(unsigned int id)
+{
+    rlvkShader *shader = rlvkGetShader(id);
+    if (shader == NULL) return;
+    if (id == RLVK.defaultShaderId) return;
+
+    rlvkFlushBeforeDestroy();
+
+    // Drop pipelines built from this shader
+    int keptPipelines = RLVK.pipelineCount;
+    for (int i = 0; i < RLVK.pipelineCount; )
+    {
+        if (RLVK.pipelines[i].key.shaderId == id)
+        {
+            vkDestroyPipeline(RLVK.device, RLVK.pipelines[i].pipeline, NULL);
+            RLVK.pipelines[i] = RLVK.pipelines[RLVK.pipelineCount - 1];
+            RLVK.pipelineCount--;
+        }
+        else i++;
+    }
+    if (RLVK.pipelineCount != keptPipelines) rlvkPipelineIndexRebuild(RLVK.pipelineSlotCount);
+
+    if (shader->vertModule != VK_NULL_HANDLE) vkDestroyShaderModule(RLVK.device, shader->vertModule, NULL);
+    if (shader->fragModule != VK_NULL_HANDLE) vkDestroyShaderModule(RLVK.device, shader->fragModule, NULL);
+    RL_FREE(shader->uniforms);
+    RL_FREE(shader->uboShadow);
+    memset(shader, 0, sizeof(*shader));
+
+    if (RLVK.state.currentShaderId == id)
+    {
+        RLVK.state.currentShaderId = RLVK.defaultShaderId;
+        RLVK.state.currentShaderLocs = RLVK.defaultShaderLocs;
+    }
+}
+
+int rlGetLocationUniform(unsigned int shaderId, const char *uniformName)
+{
+    rlvkShader *shader = rlvkGetShader(shaderId);
+    if ((shader == NULL) || (uniformName == NULL)) return -1;
+
+    // Split "name[index]" so uniform arrays resolve to base + index*stride
+    char base[RLVK_MAX_UNIFORM_NAME] = { 0 };
+    int arrayIndex = 0;
+    const char *bracket = strchr(uniformName, '[');
+    if (bracket != NULL)
+    {
+        size_t length = (size_t)(bracket - uniformName);
+        if (length >= RLVK_MAX_UNIFORM_NAME) length = RLVK_MAX_UNIFORM_NAME - 1;
+        memcpy(base, uniformName, length);
+        base[length] = '\0';
+        arrayIndex = atoi(bracket + 1);
+    }
+    else strncpy(base, uniformName, RLVK_MAX_UNIFORM_NAME - 1);
+
+    for (int i = 0; i < shader->uniformCount; i++)
+    {
+        if (strcmp(shader->uniforms[i].name, base) != 0) continue;
+        unsigned int stride = (shader->uniforms[i].arrayStride != 0)? shader->uniforms[i].arrayStride : 16u;
+        return (int)(shader->uniforms[i].offset + (unsigned int)arrayIndex*stride);
+    }
+
+    for (int i = 0; i < shader->samplerCount; i++)
+    {
+        if (strcmp(shader->samplers[i].name, base) == 0) return (int)(RLVK_LOC_SAMPLER_FLAG | shader->samplers[i].index);
+    }
+
+    // mvp/matModel are driven by rlvk through push constants
+    if (strcmp(base, "mvp") == 0) return RLVK_LOC_PUSH_FLAG | 0;
+    if (strcmp(base, "matModel") == 0) return RLVK_LOC_PUSH_FLAG | 64;
+
+    return -1;
+}
+
+int rlGetLocationAttrib(unsigned int shaderId, const char *attribName)
+{
+    rlvkShader *shader = rlvkGetShader(shaderId);
+    if ((shader == NULL) || (attribName == NULL)) return -1;
+
+    for (int i = 0; i < shader->attribCount; i++)
+    {
+        if (strcmp(shader->attribs[i].name, attribName) == 0) return (int)shader->attribs[i].index;
+    }
+    return -1;
+}
+
+//----------------------------------------------------------------------------------
+// Pipeline cache
+//----------------------------------------------------------------------------------
+static VkBlendFactor rlvkGetBlendFactor(unsigned int glFactor)
+{
+    switch (glFactor)
+    {
+        case RLVK_GL_ZERO: return VK_BLEND_FACTOR_ZERO;
+        case RLVK_GL_ONE: return VK_BLEND_FACTOR_ONE;
+        case RLVK_GL_SRC_COLOR: return VK_BLEND_FACTOR_SRC_COLOR;
+        case RLVK_GL_ONE_MINUS_SRC_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        case RLVK_GL_SRC_ALPHA: return VK_BLEND_FACTOR_SRC_ALPHA;
+        case RLVK_GL_ONE_MINUS_SRC_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        case RLVK_GL_DST_ALPHA: return VK_BLEND_FACTOR_DST_ALPHA;
+        case RLVK_GL_ONE_MINUS_DST_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+        case RLVK_GL_DST_COLOR: return VK_BLEND_FACTOR_DST_COLOR;
+        case RLVK_GL_ONE_MINUS_DST_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+        case RLVK_GL_SRC_ALPHA_SATURATE: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+        case RLVK_GL_CONSTANT_COLOR: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+        case RLVK_GL_ONE_MINUS_CONSTANT_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+        case RLVK_GL_CONSTANT_ALPHA: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        case RLVK_GL_ONE_MINUS_CONSTANT_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+        default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+
+static VkBlendOp rlvkGetBlendOp(unsigned int glEquation)
+{
+    switch (glEquation)
+    {
+        case RLVK_GL_FUNC_SUBTRACT: return VK_BLEND_OP_SUBTRACT;
+        case RLVK_GL_FUNC_REVERSE_SUBTRACT: return VK_BLEND_OP_REVERSE_SUBTRACT;
+        case RLVK_GL_MIN: return VK_BLEND_OP_MIN;
+        case RLVK_GL_MAX: return VK_BLEND_OP_MAX;
+        default: return VK_BLEND_OP_ADD;
+    }
+}
+
+// Vertex attribute description per shader-ABI location
+static VkFormat rlvkAttribFormat(unsigned int location)
+{
+    switch (location)
+    {
+        case RLVK_LOC_POSITION: return VK_FORMAT_R32G32B32_SFLOAT;
+        case RLVK_LOC_TEXCOORD: return VK_FORMAT_R32G32_SFLOAT;
+        case RLVK_LOC_NORMAL: return VK_FORMAT_R32G32B32_SFLOAT;
+        case RLVK_LOC_COLOR: return VK_FORMAT_R8G8B8A8_UNORM;
+        case RLVK_LOC_TANGENT: return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case RLVK_LOC_TEXCOORD2: return VK_FORMAT_R32G32_SFLOAT;
+        case RLVK_LOC_BONEIDS: return VK_FORMAT_R8G8B8A8_UINT;
+        case RLVK_LOC_BONEWEIGHTS: return VK_FORMAT_R32G32B32A32_SFLOAT;
+        default: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    }
+}
+
+static unsigned int rlvkAttribStride(unsigned int location)
+{
+    switch (location)
+    {
+        case RLVK_LOC_POSITION: return 12;
+        case RLVK_LOC_TEXCOORD: return 8;
+        case RLVK_LOC_NORMAL: return 12;
+        case RLVK_LOC_COLOR: return 4;
+        case RLVK_LOC_TANGENT: return 16;
+        case RLVK_LOC_TEXCOORD2: return 8;
+        case RLVK_LOC_BONEIDS: return 4;
+        case RLVK_LOC_BONEWEIGHTS: return 16;
+        default: return 16;
+    }
+}
+
+#define RLVK_BINDING_DEFAULT    15      // stride-0 binding feeding missing attributes
+#define RLVK_BINDING_INSTANCE   12      // per-instance mat4 transforms
+#define RLVK_DEFAULT_ATTRIB_BUFFER_SIZE 128
+
+// Offset of each attribute's fallback value inside the shared default attribute buffer
+static unsigned int rlvkDefaultAttribOffset(unsigned int location)
+{
+    switch (location)
+    {
+        case RLVK_LOC_NORMAL: return 16;        // (0, 0, 1)
+        case RLVK_LOC_COLOR: return 32;         // white
+        case RLVK_LOC_TANGENT: return 48;       // (0, 0, 0, 0)
+        case RLVK_LOC_BONEIDS: return 64;       // (0, 0, 0, 0)
+        case RLVK_LOC_BONEWEIGHTS: return 80;   // (1, 0, 0, 0)
+        default: return 0;                      // zeros (position/texcoords)
+    }
+}
+
+static VkPipeline rlvkCreatePipeline(const rlvkPipelineKey *key)
+{
+    rlvkShader *shader = rlvkGetShader(key->shaderId);
+    if (shader == NULL) return VK_NULL_HANDLE;
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = shader->vertModule,
+            .pName = "main"
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = shader->fragModule,
+            .pName = "main"
+        }
+    };
+
+    VkVertexInputBindingDescription bindings[16];
+    VkVertexInputAttributeDescription attributes[16];
+    uint32_t bindingCount = 0;
+    uint32_t attributeCount = 0;
+    bool defaultBindingUsed = false;
+
+    unsigned int consumed = shader->attribMask;
+    for (unsigned int location = 0; location < 8; location++)
+    {
+        if ((consumed & (1u << location)) == 0) continue;
+
+        bool available = (key->attribMask & (1u << location)) != 0;
+        uint32_t binding = available? location : RLVK_BINDING_DEFAULT;
+
+        if (available)
+        {
+            bindings[bindingCount].binding = binding;
+            bindings[bindingCount].stride = rlvkAttribStride(location);
+            bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            bindingCount++;
+        }
+        else if (!defaultBindingUsed)
+        {
+            // Zero stride: every vertex reads element 0 of the shared default buffer
+            bindings[bindingCount].binding = RLVK_BINDING_DEFAULT;
+            bindings[bindingCount].stride = 0;
+            bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            bindingCount++;
+            defaultBindingUsed = true;
+        }
+
+        attributes[attributeCount].location = location;
+        attributes[attributeCount].binding = binding;
+        attributes[attributeCount].format = rlvkAttribFormat(location);
+        attributes[attributeCount].offset = available? 0u : rlvkDefaultAttribOffset(location);
+        attributeCount++;
+    }
+
+    if ((key->layoutKind == RLVK_LAYOUT_MESH_INSTANCED) && ((consumed & (1u << RLVK_LOC_INSTANCE)) != 0))
+    {
+        bindings[bindingCount].binding = RLVK_BINDING_INSTANCE;
+        bindings[bindingCount].stride = 64;
+        bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+        bindingCount++;
+
+        for (uint32_t column = 0; column < 4; column++)
+        {
+            attributes[attributeCount].location = RLVK_LOC_INSTANCE + column;
+            attributes[attributeCount].binding = RLVK_BINDING_INSTANCE;
+            attributes[attributeCount].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            attributes[attributeCount].offset = column*16;
+            attributeCount++;
+        }
+    }
+
+    VkPipelineVertexInputStateCreateInfo vertexInput = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = bindingCount,
+        .pVertexBindingDescriptions = bindings,
+        .vertexAttributeDescriptionCount = attributeCount,
+        .pVertexAttributeDescriptions = attributes
+    };
+
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    if (key->pointMode != 0) topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    else if (key->topology == RL_LINES) topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = topology,
+        .primitiveRestartEnable = VK_FALSE
+    };
+
+    VkPipelineViewportStateCreateInfo viewportState = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1
+    };
+
+    VkPolygonMode polygonMode = VK_POLYGON_MODE_FILL;
+    if ((key->wire != 0) && RLVK.wireSupported) polygonMode = VK_POLYGON_MODE_LINE;
+    if (key->pointMode != 0) polygonMode = VK_POLYGON_MODE_POINT;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = VK_FALSE,
+        .rasterizerDiscardEnable = VK_FALSE,
+        .polygonMode = polygonMode,
+        .cullMode = (key->cullEnable != 0)? ((key->cullMode == 0)? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_BACK_BIT) : VK_CULL_MODE_NONE,
+        // raylib's front faces are CCW in GL space; a Y-flipped correction mirrors the
+        // winding, so only non-flipped (FBO) targets keep CCW
+        .frontFace = (key->frontFaceCCW != 0)? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = VK_FALSE,
+        .lineWidth = 1.0f
+    };
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT
+    };
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = (key->depthTest != 0)? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = (key->depthMask != 0)? VK_TRUE : VK_FALSE,
+        .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = VK_FALSE
+    };
+
+    VkPipelineColorBlendAttachmentState blendAttachments[4];
+    uint32_t attachmentCount = (key->colorAttachmentCount == 0)? 1 : key->colorAttachmentCount;
+    if (attachmentCount > 4) attachmentCount = 4;
+    for (uint32_t i = 0; i < attachmentCount; i++)
+    {
+        VkPipelineColorBlendAttachmentState state = {
+            .blendEnable = (key->blendEnable != 0)? VK_TRUE : VK_FALSE,
+            .srcColorBlendFactor = rlvkGetBlendFactor(key->srcRGB),
+            .dstColorBlendFactor = rlvkGetBlendFactor(key->dstRGB),
+            .colorBlendOp = rlvkGetBlendOp(key->eqRGB),
+            .srcAlphaBlendFactor = rlvkGetBlendFactor(key->srcAlpha),
+            .dstAlphaBlendFactor = rlvkGetBlendFactor(key->dstAlpha),
+            .alphaBlendOp = rlvkGetBlendOp(key->eqAlpha),
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT
+        };
+        blendAttachments[i] = state;
+    }
+
+    VkPipelineColorBlendStateCreateInfo colorBlend = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .logicOpEnable = VK_FALSE,
+        .attachmentCount = attachmentCount,
+        .pAttachments = blendAttachments
+    };
+
+    VkDynamicState dynamicStates[3] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_LINE_WIDTH
+    };
+    VkPipelineDynamicStateCreateInfo dynamicState = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 3,
+        .pDynamicStates = dynamicStates
+    };
+
+    VkGraphicsPipelineCreateInfo pipelineInfo = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &vertexInput,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState = &viewportState,
+        .pRasterizationState = &rasterizer,
+        .pMultisampleState = &multisampling,
+        .pDepthStencilState = &depthStencil,
+        .pColorBlendState = &colorBlend,
+        .pDynamicState = &dynamicState,
+        .layout = RLVK.pipelineLayout,
+        .renderPass = (VkRenderPass)(uintptr_t)key->renderPass,
+        .subpass = 0
+    };
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(RLVK.device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &pipeline) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "SHADER: Failed to create graphics pipeline");
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
+}
+
+// FNV-1a over the key bytes; keys are fully memset before filling, so padding hashes stably
+static unsigned int rlvkHashPipelineKey(const rlvkPipelineKey *key)
+{
+    const unsigned char *bytes = (const unsigned char *)key;
+    unsigned int hash = 2166136261u;
+    for (size_t i = 0; i < sizeof(*key); i++) hash = (hash ^ bytes[i])*16777619u;
+    return hash;
+}
+
+// Insert an entry index into the hash index; requires a non-NULL table with a free slot
+static void rlvkPipelineSlotInsert(unsigned int hash, int entryIndex)
+{
+    unsigned int mask = (unsigned int)RLVK.pipelineSlotCount - 1;
+    unsigned int slot = hash & mask;
+    while (RLVK.pipelineSlots[slot] >= 0) slot = (slot + 1) & mask;
+    RLVK.pipelineSlots[slot] = entryIndex;
+}
+
+// (Re)build the hash index over all cached pipelines; on OOM lookups fall back to a linear scan
+static void rlvkPipelineIndexRebuild(int slotCount)
+{
+    RL_FREE(RLVK.pipelineSlots);
+    RLVK.pipelineSlots = NULL;
+    RLVK.pipelineSlotCount = 0;
+
+    if (slotCount < 64) slotCount = 64;
+    while (slotCount*3 < RLVK.pipelineCount*4) slotCount *= 2;   // keep load factor <= 3/4
+
+    int *slots = (int *)RL_MALLOC((size_t)slotCount*sizeof(int));
+    if (slots == NULL) return;
+    for (int i = 0; i < slotCount; i++) slots[i] = -1;
+    RLVK.pipelineSlots = slots;
+    RLVK.pipelineSlotCount = slotCount;
+    for (int i = 0; i < RLVK.pipelineCount; i++) rlvkPipelineSlotInsert(RLVK.pipelines[i].keyHash, i);
+}
+
+// Look up (or build and cache) the pipeline matching the given state key
+static VkPipeline rlvkGetPipeline(const rlvkPipelineKey *key)
+{
+    unsigned int hash = rlvkHashPipelineKey(key);
+    if (RLVK.pipelineSlots != NULL)
+    {
+        unsigned int mask = (unsigned int)RLVK.pipelineSlotCount - 1;
+        for (unsigned int slot = hash & mask; RLVK.pipelineSlots[slot] >= 0; slot = (slot + 1) & mask)
+        {
+            const rlvkPipelineEntry *entry = &RLVK.pipelines[RLVK.pipelineSlots[slot]];
+            if ((entry->keyHash == hash) && (memcmp(&entry->key, key, sizeof(*key)) == 0)) return entry->pipeline;
+        }
+    }
+    else
+    {
+        for (int i = 0; i < RLVK.pipelineCount; i++)
+        {
+            if (memcmp(&RLVK.pipelines[i].key, key, sizeof(*key)) == 0) return RLVK.pipelines[i].pipeline;
+        }
+    }
+
+    VkPipeline pipeline = rlvkCreatePipeline(key);
+    if (pipeline == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+    if (RLVK.pipelineCount == RLVK.pipelineCapacity)
+    {
+        int newCapacity = (RLVK.pipelineCapacity == 0)? 32 : RLVK.pipelineCapacity*2;
+        rlvkPipelineEntry *grown = (rlvkPipelineEntry *)RL_REALLOC(RLVK.pipelines, (size_t)newCapacity*sizeof(rlvkPipelineEntry));
+        if (grown == NULL)
+        {
+            vkDestroyPipeline(RLVK.device, pipeline, NULL);
+            return VK_NULL_HANDLE;
+        }
+        RLVK.pipelines = grown;
+        RLVK.pipelineCapacity = newCapacity;
+    }
+
+    RLVK.pipelines[RLVK.pipelineCount].key = *key;
+    RLVK.pipelines[RLVK.pipelineCount].keyHash = hash;
+    RLVK.pipelines[RLVK.pipelineCount].pipeline = pipeline;
+    RLVK.pipelineCount++;
+
+    if ((RLVK.pipelineSlots == NULL) || (RLVK.pipelineCount*4 > RLVK.pipelineSlotCount*3))
+        rlvkPipelineIndexRebuild(RLVK.pipelineSlotCount*2);
+    else
+        rlvkPipelineSlotInsert(hash, RLVK.pipelineCount - 1);
+
+    return pipeline;
+}
+
+// Fill a pipeline key from the current render state
+static void rlvkFillPipelineKey(rlvkPipelineKey *key, unsigned int topology, unsigned int layoutKind, unsigned int attribMask)
+{
+    memset(key, 0, sizeof(*key));
+    key->shaderId = RLVK.state.currentShaderId;
+    key->renderPass = (unsigned long long)(uintptr_t)RLVK.activePass;
+    key->topology = topology;
+    key->attribMask = attribMask;
+    key->layoutKind = layoutKind;
+    key->depthTest = RLVK.state.depthTest? 1u : 0u;
+    key->depthMask = RLVK.state.depthMask? 1u : 0u;
+    key->cullEnable = RLVK.state.cullEnable? 1u : 0u;
+    key->cullMode = (unsigned int)RLVK.state.cullMode;
+    key->wire = RLVK.state.wireMode? 1u : 0u;
+    key->pointMode = RLVK.state.pointMode? 1u : 0u;
+    // Front-face winding follows the target's Y flip. raylib emits 2D quads in the winding
+    // its Y-flipped 2D ortho compensates for, so 2D shapes and 3D meshes reach framebuffer
+    // space with the SAME orientation - the projection's Y sign must NOT be counted again
+    // (doing so culls one of the two, which is what GL never does).
+    key->frontFaceCCW = rlvkTargetFlipsY()? 1u : 0u;
+    key->blendEnable = RLVK.state.blendEnable? 1u : 0u;
+    key->srcRGB = RLVK.state.blendSrcRGB;
+    key->dstRGB = RLVK.state.blendDstRGB;
+    key->srcAlpha = RLVK.state.blendSrcAlpha;
+    key->dstAlpha = RLVK.state.blendDstAlpha;
+    key->eqRGB = RLVK.state.blendEqRGB;
+    key->eqAlpha = RLVK.state.blendEqAlpha;
+
+    key->colorAttachmentCount = 1;
+    if (RLVK.activeTargetFbo != 0)
+    {
+        rlvkFramebuffer *fbo = &RLVK.framebuffers[RLVK.activeTargetFbo - 1];
+        if (fbo->used && (fbo->colorCount > 0)) key->colorAttachmentCount = (unsigned int)fbo->colorCount;
+    }
+}
+
+//----------------------------------------------------------------------------------
+// Device / swapchain creation
+//----------------------------------------------------------------------------------
+#if defined(RLVK_ENABLE_VALIDATION)
+static VKAPI_ATTR VkBool32 VKAPI_CALL rlvkDebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                        VkDebugUtilsMessageTypeFlagsEXT types,
+                                                        const VkDebugUtilsMessengerCallbackDataEXT *data,
+                                                        void *userData)
+{
+    (void)types; (void)userData;
+    if (data == NULL) return VK_FALSE;
+
+    int level = LOG_INFO;
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) level = LOG_ERROR;
+    else if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) level = LOG_WARNING;
+    else return VK_FALSE;
+
+    TRACELOG(level, "VULKAN: %s", data->pMessage);
+    return VK_FALSE;
+}
+#endif
+
+static bool rlvkCreateInstance(const rlvkPlatformGlue *glue)
+{
+    VkApplicationInfo appInfo = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "rayvulkan",
+        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+        .pEngineName = "rayvulkan",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_2
+    };
+
+    int extraCount = 0;
+#if defined(RLVK_ENABLE_VALIDATION)
+    extraCount = 1;
+#endif
+
+    int extensionCount = glue->requiredExtensionCount + extraCount;
+    const char **extensions = (const char **)RL_CALLOC((size_t)((extensionCount > 0)? extensionCount : 1), sizeof(const char *));
+    if (extensions == NULL) return false;
+    for (int i = 0; i < glue->requiredExtensionCount; i++) extensions[i] = glue->requiredExtensions[i];
+#if defined(RLVK_ENABLE_VALIDATION)
+    extensions[glue->requiredExtensionCount] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    const char *layers[1] = { "VK_LAYER_KHRONOS_validation" };
+#endif
+
+    VkInstanceCreateInfo createInfo = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .flags = glue->portability? (VkInstanceCreateFlags)VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0u,
+        .pApplicationInfo = &appInfo,
+        .enabledExtensionCount = (uint32_t)extensionCount,
+        .ppEnabledExtensionNames = extensions
+    };
+#if defined(RLVK_ENABLE_VALIDATION)
+    createInfo.enabledLayerCount = 1;
+    createInfo.ppEnabledLayerNames = layers;
+#endif
+
+    VkResult result = vkCreateInstance(&createInfo, NULL, &RLVK.instance);
+    RL_FREE(extensions);
+    if (result != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to create Vulkan instance (VkResult %i)", (int)result);
+        return false;
+    }
+
+    volkLoadInstance(RLVK.instance);
+
+#if defined(RLVK_ENABLE_VALIDATION)
+    if (vkCreateDebugUtilsMessengerEXT != NULL)
+    {
+        VkDebugUtilsMessengerCreateInfoEXT debugInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = rlvkDebugCallback
+        };
+        vkCreateDebugUtilsMessengerEXT(RLVK.instance, &debugInfo, NULL, &RLVK.debugMessenger);
+    }
+#endif
+    return true;
+}
+
+// True when the device exposes a queue family with graphics + present on our surface
+static bool rlvkFindQueueFamily(VkPhysicalDevice device, uint32_t *outFamily)
+{
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(device, &count, NULL);
+    if (count == 0) return false;
+
+    VkQueueFamilyProperties *families = (VkQueueFamilyProperties *)RL_CALLOC(count, sizeof(VkQueueFamilyProperties));
+    if (families == NULL) return false;
+    vkGetPhysicalDeviceQueueFamilyProperties(device, &count, families);
+
+    bool found = false;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) continue;
+
+        VkBool32 present = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(device, i, RLVK.surface, &present);
+        if (present == VK_FALSE) continue;
+
+        *outFamily = i;
+        found = true;
+        break;
+    }
+
+    RL_FREE(families);
+    return found;
+}
+
+static bool rlvkDeviceHasExtension(VkPhysicalDevice device, const char *name)
+{
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(device, NULL, &count, NULL);
+    if (count == 0) return false;
+
+    VkExtensionProperties *props = (VkExtensionProperties *)RL_CALLOC(count, sizeof(VkExtensionProperties));
+    if (props == NULL) return false;
+    vkEnumerateDeviceExtensionProperties(device, NULL, &count, props);
+
+    bool found = false;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (strcmp(props[i].extensionName, name) == 0) { found = true; break; }
+    }
+
+    RL_FREE(props);
+    return found;
+}
+
+static bool rlvkSelectPhysicalDevice(void)
+{
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(RLVK.instance, &count, NULL);
+    if (count == 0)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: No Vulkan physical devices found");
+        return false;
+    }
+
+    VkPhysicalDevice *devices = (VkPhysicalDevice *)RL_CALLOC(count, sizeof(VkPhysicalDevice));
+    if (devices == NULL) return false;
+    vkEnumeratePhysicalDevices(RLVK.instance, &count, devices);
+
+    VkPhysicalDevice best = VK_NULL_HANDLE;
+    uint32_t bestFamily = 0;
+    int bestScore = -1;
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (!rlvkDeviceHasExtension(devices[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME)) continue;
+
+        uint32_t family = 0;
+        if (!rlvkFindQueueFamily(devices[i], &family)) continue;
+
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+
+        int score = 1;
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 1000;
+        else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 500;
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            best = devices[i];
+            bestFamily = family;
+        }
+    }
+
+    RL_FREE(devices);
+
+    if (best == VK_NULL_HANDLE)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: No suitable Vulkan device (graphics + present + swapchain) found");
+        return false;
+    }
+
+    RLVK.physicalDevice = best;
+    RLVK.queueFamily = bestFamily;
+    vkGetPhysicalDeviceProperties(RLVK.physicalDevice, &RLVK.deviceProps);
+    vkGetPhysicalDeviceMemoryProperties(RLVK.physicalDevice, &RLVK.memProps);
+    vkGetPhysicalDeviceFeatures(RLVK.physicalDevice, &RLVK.deviceFeatures);
+
+    RLVK.anisotropySupported = (RLVK.deviceFeatures.samplerAnisotropy == VK_TRUE);
+    RLVK.wireSupported = (RLVK.deviceFeatures.fillModeNonSolid == VK_TRUE);
+    RLVK.wideLinesSupported = (RLVK.deviceFeatures.wideLines == VK_TRUE);
+
+    TRACELOG(LOG_INFO, "RLVK: Selected device: %s", RLVK.deviceProps.deviceName);
+    return true;
+}
+
+static bool rlvkCreateDevice(void)
+{
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo queueInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = RLVK.queueFamily,
+        .queueCount = 1,
+        .pQueuePriorities = &priority
+    };
+
+    VkPhysicalDeviceFeatures features = { 0 };
+    features.samplerAnisotropy = RLVK.anisotropySupported? VK_TRUE : VK_FALSE;
+    features.fillModeNonSolid = RLVK.wireSupported? VK_TRUE : VK_FALSE;
+    features.wideLines = RLVK.wideLinesSupported? VK_TRUE : VK_FALSE;
+    features.textureCompressionBC = RLVK.deviceFeatures.textureCompressionBC;
+    features.textureCompressionETC2 = RLVK.deviceFeatures.textureCompressionETC2;
+    features.textureCompressionASTC_LDR = RLVK.deviceFeatures.textureCompressionASTC_LDR;
+    features.independentBlend = RLVK.deviceFeatures.independentBlend;
+
+    // VK_KHR_portability_subset is mandatory to enable when the device reports it (MoltenVK)
+    const char *deviceExtensions[2] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME, NULL };
+    uint32_t deviceExtensionCount = 1;
+    if (rlvkDeviceHasExtension(RLVK.physicalDevice, "VK_KHR_portability_subset"))
+    {
+        deviceExtensions[deviceExtensionCount++] = "VK_KHR_portability_subset";
+    }
+
+    VkDeviceCreateInfo deviceInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queueInfo,
+        .enabledExtensionCount = deviceExtensionCount,
+        .ppEnabledExtensionNames = deviceExtensions,
+        .pEnabledFeatures = &features
+    };
+
+    RLVK_CHECK(vkCreateDevice(RLVK.physicalDevice, &deviceInfo, NULL, &RLVK.device), "Failed to create logical device");
+    volkLoadDevice(RLVK.device);
+    vkGetDeviceQueue(RLVK.device, RLVK.queueFamily, 0, &RLVK.queue);
+    return true;
+}
+
+static VkFormat rlvkSelectDepthFormat(void)
+{
+    VkFormat candidates[3] = { VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT };
+    for (int i = 0; i < 3; i++)
+    {
+        VkFormatProperties props;
+        vkGetPhysicalDeviceFormatProperties(RLVK.physicalDevice, candidates[i], &props);
+        if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) return candidates[i];
+    }
+    return VK_FORMAT_D32_SFLOAT;
+}
+
+// Create the two render pass variants (clear / load) for a color+depth target
+static bool rlvkCreateRenderPasses(VkFormat colorFormat, int colorCount, bool hasDepth,
+                                   VkRenderPass *outClear, VkRenderPass *outLoad,
+                                   const VkFormat *colorFormats)
+{
+    VkAttachmentDescription attachments[5];
+    VkAttachmentReference colorRefs[4];
+    VkAttachmentReference depthRef = { 0 };
+    uint32_t attachmentCount = 0;
+
+    for (int i = 0; i < colorCount; i++)
+    {
+        VkAttachmentDescription color = {
+            .format = (colorFormats != NULL)? colorFormats[i] : colorFormat,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        };
+        attachments[attachmentCount] = color;
+        colorRefs[i].attachment = attachmentCount;
+        colorRefs[i].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachmentCount++;
+    }
+
+    if (hasDepth)
+    {
+        VkAttachmentDescription depth = {
+            .format = RLVK.depthFormat,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        };
+        attachments[attachmentCount] = depth;
+        depthRef.attachment = attachmentCount;
+        depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        attachmentCount++;
+    }
+
+    VkSubpassDescription subpass = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = (uint32_t)colorCount,
+        .pColorAttachments = (colorCount > 0)? colorRefs : NULL,
+        .pDepthStencilAttachment = hasDepth? &depthRef : NULL
+    };
+
+    VkSubpassDependency dependencies[2] = {
+        {
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+        },
+        {
+            .srcSubpass = 0,
+            .dstSubpass = VK_SUBPASS_EXTERNAL,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT
+        }
+    };
+
+    VkRenderPassCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = attachmentCount,
+        .pAttachments = attachments,
+        .subpassCount = 1,
+        .pSubpasses = &subpass,
+        .dependencyCount = 2,
+        .pDependencies = dependencies
+    };
+
+    RLVK_CHECK(vkCreateRenderPass(RLVK.device, &info, NULL, outClear), "Failed to create render pass (clear)");
+
+    for (uint32_t i = 0; i < attachmentCount; i++) attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    RLVK_CHECK(vkCreateRenderPass(RLVK.device, &info, NULL, outLoad), "Failed to create render pass (load)");
+    return true;
+}
+
+static VkPresentModeKHR rlvkSelectPresentMode(bool vsync)
+{
+    uint32_t count = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(RLVK.physicalDevice, RLVK.surface, &count, NULL);
+    if (count == 0) return VK_PRESENT_MODE_FIFO_KHR;
+
+    VkPresentModeKHR *modes = (VkPresentModeKHR *)RL_CALLOC(count, sizeof(VkPresentModeKHR));
+    if (modes == NULL) return VK_PRESENT_MODE_FIFO_KHR;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(RLVK.physicalDevice, RLVK.surface, &count, modes);
+
+    VkPresentModeKHR selected = VK_PRESENT_MODE_FIFO_KHR;
+    if (!vsync)
+    {
+        bool mailbox = false, immediate = false;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mailbox = true;
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) immediate = true;
+        }
+        if (mailbox) selected = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (immediate) selected = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+
+    RL_FREE(modes);
+    return selected;
+}
+
+static bool rlvkCreateSwapchain(int width, int height)
+{
+    VkSurfaceCapabilitiesKHR caps;
+    RLVK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(RLVK.physicalDevice, RLVK.surface, &caps),
+               "Failed to query surface capabilities");
+
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX)
+    {
+        extent.width = (uint32_t)width;
+        extent.height = (uint32_t)height;
+        if (extent.width < caps.minImageExtent.width) extent.width = caps.minImageExtent.width;
+        if (extent.height < caps.minImageExtent.height) extent.height = caps.minImageExtent.height;
+        if (extent.width > caps.maxImageExtent.width) extent.width = caps.maxImageExtent.width;
+        if (extent.height > caps.maxImageExtent.height) extent.height = caps.maxImageExtent.height;
+    }
+    if ((extent.width == 0) || (extent.height == 0))
+    {
+        // Minimized window: keep the old swapchain and skip rendering
+        RLVK.swapchainExtent = extent;
+        return false;
+    }
+
+    // Surface format: prefer BGRA8/RGBA8 UNORM
+    uint32_t formatCount = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(RLVK.physicalDevice, RLVK.surface, &formatCount, NULL);
+    if (formatCount == 0)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Surface reports no formats");
+        return false;
+    }
+    VkSurfaceFormatKHR *formats = (VkSurfaceFormatKHR *)RL_CALLOC(formatCount, sizeof(VkSurfaceFormatKHR));
+    if (formats == NULL) return false;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(RLVK.physicalDevice, RLVK.surface, &formatCount, formats);
+
+    VkSurfaceFormatKHR chosen = formats[0];
+    for (uint32_t i = 0; i < formatCount; i++)
+    {
+        if (((formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) || (formats[i].format == VK_FORMAT_R8G8B8A8_UNORM)) &&
+            (formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR))
+        {
+            chosen = formats[i];
+            break;
+        }
+    }
+    RL_FREE(formats);
+
+    RLVK.presentMode = rlvkSelectPresentMode(RLVK.vsync);
+
+    uint32_t imageCount = caps.minImageCount + 1;
+    if ((caps.maxImageCount > 0) && (imageCount > caps.maxImageCount)) imageCount = caps.maxImageCount;
+
+    VkSwapchainCreateInfoKHR info = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = RLVK.surface,
+        .minImageCount = imageCount,
+        .imageFormat = chosen.format,
+        .imageColorSpace = chosen.colorSpace,
+        .imageExtent = extent,
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .preTransform = caps.currentTransform,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = RLVK.presentMode,
+        .clipped = VK_TRUE,
+        .oldSwapchain = VK_NULL_HANDLE
+    };
+
+    RLVK_CHECK(vkCreateSwapchainKHR(RLVK.device, &info, NULL, &RLVK.swapchain), "Failed to create swapchain");
+
+    RLVK.swapchainFormat = chosen.format;
+    RLVK.swapchainColorSpace = chosen.colorSpace;
+    RLVK.swapchainExtent = extent;
+    RLVK.framebufferWidth = (int)extent.width;
+    RLVK.framebufferHeight = (int)extent.height;
+
+    vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapchain, &RLVK.imageCount, NULL);
+    RLVK.swapchainImages = (VkImage *)RL_CALLOC(RLVK.imageCount, sizeof(VkImage));
+    RLVK.swapchainViews = (VkImageView *)RL_CALLOC(RLVK.imageCount, sizeof(VkImageView));
+    RLVK.swapchainFramebuffers = (VkFramebuffer *)RL_CALLOC(RLVK.imageCount, sizeof(VkFramebuffer));
+    RLVK.renderFinished = (VkSemaphore *)RL_CALLOC(RLVK.imageCount, sizeof(VkSemaphore));
+    RLVK.imagesInFlight = (VkFence *)RL_CALLOC(RLVK.imageCount, sizeof(VkFence));
+    if ((RLVK.swapchainImages == NULL) || (RLVK.swapchainViews == NULL) || (RLVK.swapchainFramebuffers == NULL) ||
+        (RLVK.renderFinished == NULL) || (RLVK.imagesInFlight == NULL)) return false;
+    vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapchain, &RLVK.imageCount, RLVK.swapchainImages);
+
+    // Depth buffer
+    if (!rlvkCreateImage((int)extent.width, (int)extent.height, 1, 1, RLVK.depthFormat,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT, false, NULL,
+                         &RLVK.depthImage, &RLVK.depthMemory, &RLVK.depthView))
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to create depth buffer");
+        return false;
+    }
+
+    // Screen-capture copy target (see rlReadScreenPixels)
+    RLVK.captureValid = false;
+    if (!rlvkCreateImage((int)extent.width, (int)extent.height, 1, 1, RLVK.swapchainFormat,
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, false, NULL,
+                         &RLVK.captureImage, &RLVK.captureMemory, NULL))
+    {
+        TRACELOG(LOG_WARNING, "RLVK: Screen capture image not available, LoadImageFromScreen() disabled");
+    }
+
+    if (RLVK.swapPassClear == VK_NULL_HANDLE)
+    {
+        if (!rlvkCreateRenderPasses(RLVK.swapchainFormat, 1, true, &RLVK.swapPassClear, &RLVK.swapPassLoad, NULL)) return false;
+    }
+
+    for (uint32_t i = 0; i < RLVK.imageCount; i++)
+    {
+        VkImageViewCreateInfo viewInfo = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = RLVK.swapchainImages[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = RLVK.swapchainFormat,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+        };
+        RLVK_CHECK(vkCreateImageView(RLVK.device, &viewInfo, NULL, &RLVK.swapchainViews[i]), "Failed to create swapchain image view");
+
+        VkImageView attachments[2] = { RLVK.swapchainViews[i], RLVK.depthView };
+        VkFramebufferCreateInfo fbInfo = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = RLVK.swapPassClear,
+            .attachmentCount = 2,
+            .pAttachments = attachments,
+            .width = extent.width,
+            .height = extent.height,
+            .layers = 1
+        };
+        RLVK_CHECK(vkCreateFramebuffer(RLVK.device, &fbInfo, NULL, &RLVK.swapchainFramebuffers[i]), "Failed to create framebuffer");
+
+        VkSemaphoreCreateInfo semInfo = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        RLVK_CHECK(vkCreateSemaphore(RLVK.device, &semInfo, NULL, &RLVK.renderFinished[i]), "Failed to create semaphore");
+    }
+
+    TRACELOG(LOG_INFO, "RLVK: Swapchain created (%ux%u, %u images, present mode %i)",
+             extent.width, extent.height, RLVK.imageCount, (int)RLVK.presentMode);
+    return true;
+}
+
+static void rlvkDestroySwapchain(void)
+{
+    if (RLVK.device == VK_NULL_HANDLE) return;
+
+    for (uint32_t i = 0; i < RLVK.imageCount; i++)
+    {
+        if (RLVK.swapchainFramebuffers != NULL) vkDestroyFramebuffer(RLVK.device, RLVK.swapchainFramebuffers[i], NULL);
+        if (RLVK.swapchainViews != NULL) vkDestroyImageView(RLVK.device, RLVK.swapchainViews[i], NULL);
+        if (RLVK.renderFinished != NULL) vkDestroySemaphore(RLVK.device, RLVK.renderFinished[i], NULL);
+    }
+
+    RL_FREE(RLVK.swapchainFramebuffers); RLVK.swapchainFramebuffers = NULL;
+    RL_FREE(RLVK.swapchainViews); RLVK.swapchainViews = NULL;
+    RL_FREE(RLVK.swapchainImages); RLVK.swapchainImages = NULL;
+    RL_FREE(RLVK.renderFinished); RLVK.renderFinished = NULL;
+    RL_FREE(RLVK.imagesInFlight); RLVK.imagesInFlight = NULL;
+    RLVK.imageCount = 0;
+
+    if (RLVK.captureImage != VK_NULL_HANDLE) { vkDestroyImage(RLVK.device, RLVK.captureImage, NULL); RLVK.captureImage = VK_NULL_HANDLE; }
+    if (RLVK.captureMemory != VK_NULL_HANDLE) { vkFreeMemory(RLVK.device, RLVK.captureMemory, NULL); RLVK.captureMemory = VK_NULL_HANDLE; }
+    RLVK.captureValid = false;
+
+    if (RLVK.depthView != VK_NULL_HANDLE) { vkDestroyImageView(RLVK.device, RLVK.depthView, NULL); RLVK.depthView = VK_NULL_HANDLE; }
+    if (RLVK.depthImage != VK_NULL_HANDLE) { vkDestroyImage(RLVK.device, RLVK.depthImage, NULL); RLVK.depthImage = VK_NULL_HANDLE; }
+    if (RLVK.depthMemory != VK_NULL_HANDLE) { vkFreeMemory(RLVK.device, RLVK.depthMemory, NULL); RLVK.depthMemory = VK_NULL_HANDLE; }
+
+    if (RLVK.swapchain != VK_NULL_HANDLE) { vkDestroySwapchainKHR(RLVK.device, RLVK.swapchain, NULL); RLVK.swapchain = VK_NULL_HANDLE; }
+}
+
+static void rlvkRecreateSwapchain(int width, int height)
+{
+    if (RLVK.device == VK_NULL_HANDLE) return;
+
+    vkDeviceWaitIdle(RLVK.device);
+    rlvkDestroySwapchain();
+
+    RLVK.swapchainOutOfDate = false;
+    if (!rlvkCreateSwapchain(width, height))
+    {
+        RLVK.skipFrame = true;
+        return;
+    }
+
+    RLVK.state.viewport.x = 0.0f;
+    RLVK.state.viewport.y = 0.0f;
+    RLVK.state.viewport.width = (float)RLVK.swapchainExtent.width;
+    RLVK.state.viewport.height = (float)RLVK.swapchainExtent.height;
+    RLVK.state.viewport.minDepth = 0.0f;
+    RLVK.state.viewport.maxDepth = 1.0f;
+    RLVK.state.scissor.offset.x = 0;
+    RLVK.state.scissor.offset.y = 0;
+    RLVK.state.scissor.extent = RLVK.swapchainExtent;
+}
+
+//----------------------------------------------------------------------------------
+// Initialization
+//----------------------------------------------------------------------------------
+
+// Create a device-local buffer initialized from 'data' through a staging copy
+static bool rlvkCreateDeviceLocalBuffer(const void *data, VkDeviceSize size, VkBufferUsageFlags usage,
+                                        VkBuffer *outBuffer, VkDeviceMemory *outMemory)
+{
+    if (!rlvkCreateBuffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                          outBuffer, outMemory, NULL)) return false;
+    if (data == NULL) return true;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    unsigned char *mapped = NULL;
+    if (!rlvkCreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &stagingMemory, &mapped)) return false;
+    memcpy(mapped, data, (size_t)size);
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd != VK_NULL_HANDLE)
+    {
+        VkBufferCopy copy = { .size = size };
+        vkCmdCopyBuffer(cmd, staging, *outBuffer, 1, &copy);
+        rlvkEndOneShot(cmd);
+    }
+    rlvkDestroyBufferObject(staging, stagingMemory, true);
+    return true;
+}
+
+static bool rlvkInitDescriptorLayouts(void)
+{
+    VkDescriptorSetLayoutBinding uboBinding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+    };
+    VkDescriptorSetLayoutCreateInfo uboInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &uboBinding
+    };
+    RLVK_CHECK(vkCreateDescriptorSetLayout(RLVK.device, &uboInfo, NULL, &RLVK.setLayoutUBO), "Failed to create UBO set layout");
+
+    VkDescriptorSetLayoutBinding textureBindings[RLVK_MAX_TEXTURE_SLOTS];
+    for (int i = 0; i < RLVK_MAX_TEXTURE_SLOTS; i++)
+    {
+        VkDescriptorSetLayoutBinding binding = {
+            .binding = (uint32_t)i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT
+        };
+        textureBindings[i] = binding;
+    }
+    VkDescriptorSetLayoutCreateInfo textureInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = RLVK_MAX_TEXTURE_SLOTS,
+        .pBindings = textureBindings
+    };
+    RLVK_CHECK(vkCreateDescriptorSetLayout(RLVK.device, &textureInfo, NULL, &RLVK.setLayoutTextures), "Failed to create texture set layout");
+
+    VkDescriptorSetLayout layouts[2] = { RLVK.setLayoutUBO, RLVK.setLayoutTextures };
+    VkPushConstantRange pushRange = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = RLVK_PUSH_CONSTANT_SIZE
+    };
+    VkPipelineLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 2,
+        .pSetLayouts = layouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushRange
+    };
+    RLVK_CHECK(vkCreatePipelineLayout(RLVK.device, &layoutInfo, NULL, &RLVK.pipelineLayout), "Failed to create pipeline layout");
+    return true;
+}
+
+static bool rlvkInitFrames(void)
+{
+    for (int i = 0; i < RLVK_MAX_FRAMES_IN_FLIGHT; i++)
+    {
+        rlvkFrame *frame = &RLVK.frames[i];
+
+        VkCommandPoolCreateInfo poolInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = RLVK.queueFamily
+        };
+        RLVK_CHECK(vkCreateCommandPool(RLVK.device, &poolInfo, NULL, &frame->cmdPool), "Failed to create frame command pool");
+
+        VkCommandBufferAllocateInfo cmdInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = frame->cmdPool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1
+        };
+        RLVK_CHECK(vkAllocateCommandBuffers(RLVK.device, &cmdInfo, &frame->cmd), "Failed to allocate frame command buffer");
+
+        VkSemaphoreCreateInfo semInfo = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        RLVK_CHECK(vkCreateSemaphore(RLVK.device, &semInfo, NULL, &frame->imageAvailable), "Failed to create frame semaphore");
+
+        VkFenceCreateInfo fenceInfo = {
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT
+        };
+        RLVK_CHECK(vkCreateFence(RLVK.device, &fenceInfo, NULL, &frame->inFlight), "Failed to create frame fence");
+    }
+    return true;
+}
+
+// CPU-side batch arrays + the static quad index buffer
+static bool rlvkInitRenderBatch(void)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+    int elements = RL_DEFAULT_BATCH_BUFFER_ELEMENTS;
+    int vertices = elements*4;
+
+    batch->elementCount = elements;
+    batch->positions = (float *)RL_CALLOC((size_t)vertices*3, sizeof(float));
+    batch->texcoords = (float *)RL_CALLOC((size_t)vertices*2, sizeof(float));
+    batch->normals = (float *)RL_CALLOC((size_t)vertices*3, sizeof(float));
+    batch->colors = (unsigned char *)RL_CALLOC((size_t)vertices*4, sizeof(unsigned char));
+    if ((batch->positions == NULL) || (batch->texcoords == NULL) || (batch->normals == NULL) || (batch->colors == NULL))
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to allocate render batch arrays");
+        return false;
+    }
+
+    uint32_t *indices = (uint32_t *)RL_CALLOC((size_t)elements*6, sizeof(uint32_t));
+    if (indices == NULL) return false;
+    for (int i = 0; i < elements; i++)
+    {
+        indices[i*6 + 0] = (uint32_t)(4*i + 0);
+        indices[i*6 + 1] = (uint32_t)(4*i + 1);
+        indices[i*6 + 2] = (uint32_t)(4*i + 2);
+        indices[i*6 + 3] = (uint32_t)(4*i + 0);
+        indices[i*6 + 4] = (uint32_t)(4*i + 2);
+        indices[i*6 + 5] = (uint32_t)(4*i + 3);
+    }
+    bool ok = rlvkCreateDeviceLocalBuffer(indices, (VkDeviceSize)elements*6*sizeof(uint32_t),
+                                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &batch->indexBuffer, &batch->indexMemory);
+    RL_FREE(indices);
+    if (!ok) return false;
+
+    batch->drawCount = 1;
+    batch->draws[0].mode = RL_QUADS;
+    batch->draws[0].vertexCount = 0;
+    batch->draws[0].vertexAlignment = 0;
+    batch->draws[0].textureId = RLVK.defaultTextureId;
+    batch->currentDepth = -1.0f;
+    return true;
+}
+
+// Shared fallback vertex attribute values (see note [3])
+static bool rlvkInitDefaultAttribBuffer(void)
+{
+    unsigned char data[RLVK_DEFAULT_ATTRIB_BUFFER_SIZE];
+    memset(data, 0, sizeof(data));
+
+    float normal[3] = { 0.0f, 0.0f, 1.0f };
+    memcpy(data + 16, normal, sizeof(normal));
+    data[32] = 255; data[33] = 255; data[34] = 255; data[35] = 255;   // white color
+    float weights[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    memcpy(data + 80, weights, sizeof(weights));
+
+    return rlvkCreateDeviceLocalBuffer(data, sizeof(data), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                       &RLVK.defaultAttribBuffer, &RLVK.defaultAttribMemory);
+}
+
+static void rlvkResetState(void)
+{
+    rlvkState *state = &RLVK.state;
+
+    state->modelview = MatIdentity();
+    state->projection = MatIdentity();
+    state->transform = MatIdentity();
+    state->transformRequired = false;
+    state->currentMatrix = &state->modelview;
+    state->currentMatrixMode = RL_MODELVIEW;
+    state->stackCounter = 0;
+
+    state->currentMode = 0;
+    state->texcoordx = 0.0f; state->texcoordy = 0.0f;
+    state->normalx = 0.0f; state->normaly = 0.0f; state->normalz = 1.0f;
+    state->colorr = 255; state->colorg = 255; state->colorb = 255; state->colora = 255;
+
+    state->depthTest = false;
+    state->depthMask = true;
+    state->cullEnable = true;       // rlgl enables GL_CULL_FACE at init
+    state->cullMode = 1;
+    state->wireMode = false;
+    state->pointMode = false;
+    state->lineWidth = 1.0f;
+    state->blendEnable = true;
+    state->blendMode = -1;
+
+    state->clearColor[0] = 0.0f; state->clearColor[1] = 0.0f;
+    state->clearColor[2] = 0.0f; state->clearColor[3] = 1.0f;
+    state->clearDepth = 1.0f;
+
+    state->activeTextureSlot = 0;
+    state->activeFramebuffer = 0;
+    state->readFramebuffer = 0;
+    state->scissorTest = false;
+}
+
+bool rlvkInit(const rlvkPlatformGlue *glue, int width, int height, bool vsync)
+{
+    if (RLVK.initialized) return true;
+    if (glue == NULL)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Platform glue is required to initialize Vulkan");
+        return false;
+    }
+
+    memset(&RLVK, 0, sizeof(RLVK));
+    RLVK.vsync = vsync;
+    RLVK.cullDistanceNear = RL_CULL_DISTANCE_NEAR;
+    RLVK.cullDistanceFar = RL_CULL_DISTANCE_FAR;
+
+    if (volkInitialize() != VK_SUCCESS)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Vulkan loader not found (volkInitialize failed)");
+        return false;
+    }
+
+    if (!rlvkCreateInstance(glue)) return false;
+
+    if (glue->createSurface == NULL)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Platform glue does not provide createSurface");
+        return false;
+    }
+    RLVK.surface = (VkSurfaceKHR)glue->createSurface((void *)RLVK.instance, glue->userData);
+    if (RLVK.surface == VK_NULL_HANDLE)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Platform failed to create Vulkan surface");
+        return false;
+    }
+
+    if (!rlvkSelectPhysicalDevice()) return false;
+    if (!rlvkCreateDevice()) return false;
+
+    RLVK.depthFormat = rlvkSelectDepthFormat();
+
+    VkCommandPoolCreateInfo transientInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = RLVK.queueFamily
+    };
+    RLVK_CHECK(vkCreateCommandPool(RLVK.device, &transientInfo, NULL, &RLVK.transientPool), "Failed to create transient command pool");
+
+    if (!rlvkCreateSwapchain(width, height)) return false;
+    if (!rlvkInitFrames()) return false;
+    if (!rlvkInitDescriptorLayouts()) return false;
+    if (!rlvkInitDefaultAttribBuffer()) return false;
+
+    rlvkResetState();
+    RLVK.initialized = true;
+
+    // Default 1x1 white texture (handle 1)
+    unsigned char white[4] = { 255, 255, 255, 255 };
+    RLVK.defaultTextureId = rlLoadTexture(white, 1, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+    if (RLVK.defaultTextureId == 0)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to create default texture");
+        return false;
+    }
+    RLVK.state.currentTextureId = RLVK.defaultTextureId;
+    for (int i = 0; i < RLVK_MAX_TEXTURE_SLOTS; i++) RLVK.state.activeTextures[i] = 0;
+
+    // Default shader from embedded SPIR-V
+    RLVK.defaultShaderId = rlLoadShaderCodeSize(default_vert_spv_data, (int)default_vert_spv_size,
+                                                default_frag_spv_data, (int)default_frag_spv_size);
+    if (RLVK.defaultShaderId == 0)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Failed to load default shader");
+        return false;
+    }
+    memcpy(RLVK.defaultShaderLocs, RLVK.shaders[RLVK.defaultShaderId - 1].locs, sizeof(RLVK.defaultShaderLocs));
+    RLVK.state.currentShaderId = RLVK.defaultShaderId;
+    RLVK.state.currentShaderLocs = RLVK.defaultShaderLocs;
+
+    if (!rlvkInitRenderBatch()) return false;
+
+    rlSetBlendMode(BLEND_ALPHA);
+    RLVK.state.viewport.x = 0.0f;
+    RLVK.state.viewport.y = 0.0f;
+    RLVK.state.viewport.width = (float)RLVK.swapchainExtent.width;
+    RLVK.state.viewport.height = (float)RLVK.swapchainExtent.height;
+    RLVK.state.viewport.minDepth = 0.0f;
+    RLVK.state.viewport.maxDepth = 1.0f;
+    RLVK.state.scissor.offset.x = 0;
+    RLVK.state.scissor.offset.y = 0;
+    RLVK.state.scissor.extent = RLVK.swapchainExtent;
+    RLVK.targetWidth = (int)RLVK.swapchainExtent.width;
+    RLVK.targetHeight = (int)RLVK.swapchainExtent.height;
+
+    RLVK.ready = true;
+    TRACELOG(LOG_INFO, "RLVK: Vulkan renderer initialized successfully");
+    return true;
+}
+
+bool rlvkIsReady(void)
+{
+    return RLVK.ready && (RLVK.device != VK_NULL_HANDLE) && (RLVK.swapchain != VK_NULL_HANDLE);
+}
+
+const char *rlGetVersion(void)
+{
+    return "rlvk 1.0 (Vulkan)";
+}
+
+void rlvkClose(void)
+{
+    if (!RLVK.initialized) return;
+
+    vkDeviceWaitIdle(RLVK.device);
+
+    // Pending async one-shot command buffers
+    for (int i = 0; i < RLVK.pendingCount; i++)
+    {
+        vkDestroyFence(RLVK.device, RLVK.pending[i].fence, NULL);
+        vkFreeCommandBuffers(RLVK.device, RLVK.transientPool, 1, &RLVK.pending[i].cmd);
+    }
+    RL_FREE(RLVK.pending); RLVK.pending = NULL;
+    RLVK.pendingCount = 0;
+    RLVK.pendingCapacity = 0;
+
+    // Framebuffers (render textures)
+    for (int i = 0; i < RLVK.framebufferCapacity; i++)
+    {
+        rlvkFramebuffer *fbo = &RLVK.framebuffers[i];
+        if (!fbo->used) continue;
+        if (fbo->framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(RLVK.device, fbo->framebuffer, NULL);
+        if (fbo->passClear != VK_NULL_HANDLE) vkDestroyRenderPass(RLVK.device, fbo->passClear, NULL);
+        if (fbo->passLoad != VK_NULL_HANDLE) vkDestroyRenderPass(RLVK.device, fbo->passLoad, NULL);
+        for (int c = 0; c < 4; c++)
+        {
+            if (fbo->color[c].view != VK_NULL_HANDLE) vkDestroyImageView(RLVK.device, fbo->color[c].view, NULL);
+        }
+        if (fbo->depth.view != VK_NULL_HANDLE) vkDestroyImageView(RLVK.device, fbo->depth.view, NULL);
+    }
+    RL_FREE(RLVK.framebuffers); RLVK.framebuffers = NULL;
+    RLVK.framebufferCapacity = 0;
+
+    // Shaders
+    for (int i = 0; i < RLVK.shaderCapacity; i++)
+    {
+        rlvkShader *shader = &RLVK.shaders[i];
+        if (!shader->used) continue;
+        if (shader->vertModule != VK_NULL_HANDLE) vkDestroyShaderModule(RLVK.device, shader->vertModule, NULL);
+        if (shader->fragModule != VK_NULL_HANDLE) vkDestroyShaderModule(RLVK.device, shader->fragModule, NULL);
+        RL_FREE(shader->uniforms);
+        RL_FREE(shader->uboShadow);
+    }
+    RL_FREE(RLVK.shaders); RLVK.shaders = NULL;
+    RLVK.shaderCapacity = 0;
+
+    // Textures
+    for (int i = 0; i < RLVK.textureCapacity; i++)
+    {
+        rlvkTexture *texture = &RLVK.textures[i];
+        if (!texture->used) continue;
+        if (texture->view != VK_NULL_HANDLE) vkDestroyImageView(RLVK.device, texture->view, NULL);
+        if (texture->ownsImage && (texture->image != VK_NULL_HANDLE)) vkDestroyImage(RLVK.device, texture->image, NULL);
+        if (texture->memory != VK_NULL_HANDLE) vkFreeMemory(RLVK.device, texture->memory, NULL);
+    }
+    RL_FREE(RLVK.textures); RLVK.textures = NULL;
+    RLVK.textureCapacity = 0;
+
+    // Mesh buffers
+    for (int i = 0; i < RLVK.bufferCapacity; i++)
+    {
+        rlvkBuffer *buffer = &RLVK.buffers[i];
+        if (!buffer->used) continue;
+        rlvkDestroyBufferObject(buffer->buffer, buffer->memory, buffer->mapped != NULL);
+    }
+    RL_FREE(RLVK.buffers); RLVK.buffers = NULL;
+    RLVK.bufferCapacity = 0;
+
+    // Pipelines and samplers
+    for (int i = 0; i < RLVK.pipelineCount; i++) vkDestroyPipeline(RLVK.device, RLVK.pipelines[i].pipeline, NULL);
+    RL_FREE(RLVK.pipelines); RLVK.pipelines = NULL;
+    RLVK.pipelineCount = 0; RLVK.pipelineCapacity = 0;
+    RL_FREE(RLVK.pipelineSlots); RLVK.pipelineSlots = NULL;
+    RLVK.pipelineSlotCount = 0;
+
+    for (int i = 0; i < RLVK.samplerCount; i++) vkDestroySampler(RLVK.device, RLVK.samplers[i].sampler, NULL);
+    RL_FREE(RLVK.samplers); RLVK.samplers = NULL;
+    RLVK.samplerCount = 0; RLVK.samplerCapacity = 0;
+
+    // Render batch
+    RL_FREE(RLVK.batch.positions);
+    RL_FREE(RLVK.batch.texcoords);
+    RL_FREE(RLVK.batch.normals);
+    RL_FREE(RLVK.batch.colors);
+    rlvkDestroyBufferObject(RLVK.batch.indexBuffer, RLVK.batch.indexMemory, false);
+    memset(&RLVK.batch, 0, sizeof(RLVK.batch));
+
+    rlvkDestroyBufferObject(RLVK.defaultAttribBuffer, RLVK.defaultAttribMemory, false);
+
+    // Frames
+    for (int i = 0; i < RLVK_MAX_FRAMES_IN_FLIGHT; i++)
+    {
+        rlvkFrame *frame = &RLVK.frames[i];
+        for (int c = 0; c < frame->chunkCount; c++) rlvkDestroyBufferObject(frame->chunks[c].buffer, frame->chunks[c].memory, true);
+        RL_FREE(frame->chunks);
+        for (int p = 0; p < frame->descPoolCount; p++) vkDestroyDescriptorPool(RLVK.device, frame->descPools[p], NULL);
+        RL_FREE(frame->descPools);
+        if (frame->imageAvailable != VK_NULL_HANDLE) vkDestroySemaphore(RLVK.device, frame->imageAvailable, NULL);
+        if (frame->inFlight != VK_NULL_HANDLE) vkDestroyFence(RLVK.device, frame->inFlight, NULL);
+        if (frame->cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(RLVK.device, frame->cmdPool, NULL);
+    }
+
+    if (RLVK.pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(RLVK.device, RLVK.pipelineLayout, NULL);
+    if (RLVK.setLayoutUBO != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(RLVK.device, RLVK.setLayoutUBO, NULL);
+    if (RLVK.setLayoutTextures != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(RLVK.device, RLVK.setLayoutTextures, NULL);
+
+    rlvkDestroySwapchain();
+    if (RLVK.swapPassClear != VK_NULL_HANDLE) vkDestroyRenderPass(RLVK.device, RLVK.swapPassClear, NULL);
+    if (RLVK.swapPassLoad != VK_NULL_HANDLE) vkDestroyRenderPass(RLVK.device, RLVK.swapPassLoad, NULL);
+    if (RLVK.transientPool != VK_NULL_HANDLE) vkDestroyCommandPool(RLVK.device, RLVK.transientPool, NULL);
+
+    if (RLVK.device != VK_NULL_HANDLE) vkDestroyDevice(RLVK.device, NULL);
+    if (RLVK.surface != VK_NULL_HANDLE) vkDestroySurfaceKHR(RLVK.instance, RLVK.surface, NULL);
+#if defined(RLVK_ENABLE_VALIDATION)
+    if (RLVK.debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(RLVK.instance, RLVK.debugMessenger, NULL);
+#endif
+    if (RLVK.instance != VK_NULL_HANDLE) vkDestroyInstance(RLVK.instance, NULL);
+
+    memset(&RLVK, 0, sizeof(RLVK));
+    TRACELOG(LOG_INFO, "RLVK: Vulkan renderer closed");
+}
+
+void rlvkResize(int width, int height)
+{
+    if (!RLVK.initialized) return;
+    rlvkRecreateSwapchain(width, height);
+    RLVK.framebufferWidth = (int)RLVK.swapchainExtent.width;
+    RLVK.framebufferHeight = (int)RLVK.swapchainExtent.height;
+    RLVK.targetWidth = RLVK.framebufferWidth;
+    RLVK.targetHeight = RLVK.framebufferHeight;
+}
+
+void rlvkSetVSync(bool vsync)
+{
+    if (!RLVK.initialized || (RLVK.vsync == vsync)) return;
+    RLVK.vsync = vsync;
+    rlvkRecreateSwapchain((int)RLVK.swapchainExtent.width, (int)RLVK.swapchainExtent.height);
+}
+
+//----------------------------------------------------------------------------------
+// Render pass management (lazy begin, see rlvk.h DESIGN)
+//----------------------------------------------------------------------------------
+static VkCommandBuffer rlvkCurrentCmd(void)
+{
+    return RLVK.frames[RLVK.frameIndex].cmd;
+}
+
+static void rlvkSetDynamicState(void)
+{
+    if (!RLVK.frameRecording) return;
+    VkCommandBuffer cmd = rlvkCurrentCmd();
+
+    VkViewport viewport = RLVK.state.viewport;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor = RLVK.state.scissor;
+    if (!RLVK.state.scissorTest)
+    {
+        scissor.offset.x = 0;
+        scissor.offset.y = 0;
+        scissor.extent.width = (uint32_t)RLVK.targetWidth;
+        scissor.extent.height = (uint32_t)RLVK.targetHeight;
+    }
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    float lineWidth = RLVK.wideLinesSupported? RLVK.state.lineWidth : 1.0f;
+    vkCmdSetLineWidth(cmd, lineWidth);
+}
+
+static void rlvkBeginRenderPass(void)
+{
+    if (RLVK.passActive) return;
+    if (!rlvkEnsureRecording()) return;
+    if ((RLVK.activeTargetFbo == 0) && !rlvkAcquireSwapchainImage()) return;
+
+    VkCommandBuffer cmd = rlvkCurrentCmd();
+    VkClearValue clearValues[5];
+    uint32_t clearCount = 0;
+    uint32_t colorClearCount = 0;
+    bool targetHasDepth = false;
+    VkRenderPassBeginInfo info = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+
+    if (RLVK.activeTargetFbo == 0)
+    {
+        bool clear = RLVK.state.swapchainClearPending;
+        RLVK.activePass = clear? RLVK.swapPassClear : RLVK.swapPassLoad;
+        info.renderPass = RLVK.activePass;
+        info.framebuffer = RLVK.swapchainFramebuffers[RLVK.imageIndex];
+        info.renderArea.extent = RLVK.swapchainExtent;
+        RLVK.state.swapchainClearPending = false;
+        RLVK.swapchainPassUsed = true;
+        colorClearCount = 1;
+        targetHasDepth = true;
+        clearCount = 2;
+    }
+    else
+    {
+        rlvkFramebuffer *fbo = &RLVK.framebuffers[RLVK.activeTargetFbo - 1];
+        if (!fbo->used || !fbo->complete) return;
+
+        // Attachments must be in COLOR/DEPTH attachment layout for the pass
+        for (int i = 0; i < fbo->colorCount; i++)
+        {
+            rlvkTexture *texture = rlvkGetTexture(fbo->color[i].texId);
+            if (texture == NULL) continue;
+            rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+            texture->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
+        if (fbo->hasDepth)
+        {
+            rlvkTexture *texture = rlvkGetTexture(fbo->depth.texId);
+            if (texture != NULL)
+            {
+                rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout,
+                                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 0, 1, 0, 1);
+                texture->layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            }
+        }
+
+        RLVK.activePass = fbo->clearPending? fbo->passClear : fbo->passLoad;
+        info.renderPass = RLVK.activePass;
+        info.framebuffer = fbo->framebuffer;
+        info.renderArea.extent.width = (uint32_t)fbo->width;
+        info.renderArea.extent.height = (uint32_t)fbo->height;
+        fbo->clearPending = false;
+        colorClearCount = (uint32_t)fbo->colorCount;
+        targetHasDepth = fbo->hasDepth;
+        clearCount = colorClearCount + (targetHasDepth? 1u : 0u);
+    }
+
+    // Clear values are positional: colors first, then the depth attachment (when present)
+    for (uint32_t i = 0; i < colorClearCount; i++)
+    {
+        memcpy(clearValues[i].color.float32, RLVK.state.clearColor, sizeof(RLVK.state.clearColor));
+    }
+    if (targetHasDepth)
+    {
+        clearValues[colorClearCount].depthStencil.depth = RLVK.state.clearDepth;
+        clearValues[colorClearCount].depthStencil.stencil = 0;
+    }
+    info.clearValueCount = clearCount;
+    info.pClearValues = clearValues;
+
+    vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+    RLVK.passActive = true;
+    rlvkSetDynamicState();
+}
+
+static void rlvkEndRenderPass(void)
+{
+    if (!RLVK.passActive || !RLVK.frameRecording) return;
+
+    VkCommandBuffer cmd = rlvkCurrentCmd();
+    vkCmdEndRenderPass(cmd);
+    RLVK.passActive = false;
+
+    if (RLVK.activeTargetFbo != 0)
+    {
+        rlvkFramebuffer *fbo = &RLVK.framebuffers[RLVK.activeTargetFbo - 1];
+        for (int i = 0; i < fbo->colorCount; i++)
+        {
+            rlvkTexture *texture = rlvkGetTexture(fbo->color[i].texId);
+            if (texture == NULL) continue;
+            rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, (uint32_t)texture->mipmaps, 0, (uint32_t)texture->layers);
+            texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        if (fbo->hasDepth)
+        {
+            rlvkTexture *texture = rlvkGetTexture(fbo->depth.texId);
+            if ((texture != NULL) && texture->sampleable)
+            {
+                rlvkTransitionImage(cmd, texture->image, texture->aspect, texture->layout,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, 0, 1);
+                texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+        }
+    }
+}
+
+//----------------------------------------------------------------------------------
+// Descriptor set helpers
+//----------------------------------------------------------------------------------
+static VkDescriptorSet rlvkBuildUniformSet(rlvkShader *shader)
+{
+    VkDeviceSize alignment = RLVK.deviceProps.limits.minUniformBufferOffsetAlignment;
+    if (alignment < 16) alignment = 16;
+
+    rlvkAlloc alloc = rlvkFrameAlloc(shader->uboSize, alignment);
+    if (alloc.ptr == NULL) return VK_NULL_HANDLE;
+    memcpy(alloc.ptr, shader->uboShadow, shader->uboSize);
+
+    VkDescriptorSet set = rlvkFrameAllocDescriptorSet(RLVK.setLayoutUBO);
+    if (set == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+    VkDescriptorBufferInfo bufferInfo = {
+        .buffer = alloc.buffer,
+        .offset = alloc.offset,
+        .range = shader->uboSize
+    };
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &bufferInfo
+    };
+    vkUpdateDescriptorSets(RLVK.device, 1, &write, 0, NULL);
+    return set;
+}
+
+// True when 'id' is an attachment of the framebuffer currently being rendered into.
+// Sampling such a texture is a feedback loop: GL leaves it undefined, Vulkan rejects it
+// (the image is in attachment layout, not SHADER_READ_ONLY), so we substitute the default
+// texture instead of reading the image we are writing.
+static bool rlvkIsActiveAttachment(unsigned int id)
+{
+    if ((id == 0) || (RLVK.activeTargetFbo == 0)) return false;
+
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(RLVK.activeTargetFbo);
+    if (fbo == NULL) return false;
+
+    for (int i = 0; i < fbo->colorCount; i++)
+    {
+        if (fbo->color[i].texId == id) return true;
+    }
+    return (fbo->hasDepth && (fbo->depth.texId == id));
+}
+
+// Build the set 1 descriptor (texture0..texture3); slot 0 may be overridden by the batch texture
+static VkDescriptorSet rlvkBuildTextureSet(unsigned int slot0Override)
+{
+    VkDescriptorSet set = rlvkFrameAllocDescriptorSet(RLVK.setLayoutTextures);
+    if (set == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+    VkDescriptorImageInfo images[RLVK_MAX_TEXTURE_SLOTS];
+    VkWriteDescriptorSet writes[RLVK_MAX_TEXTURE_SLOTS];
+    rlvkTexture *defaultTexture = rlvkGetTexture(RLVK.defaultTextureId);
+
+    for (int i = 0; i < RLVK_MAX_TEXTURE_SLOTS; i++)
+    {
+        unsigned int id = RLVK.state.activeTextures[i];
+        if ((i == 0) && (slot0Override != 0)) id = slot0Override;
+
+        if (rlvkIsActiveAttachment(id))
+        {
+            if (!RLVK.attachmentFeedbackWarned)
+            {
+                TRACELOG(LOG_DEBUG, "TEXTURE: [ID %i] Sampled while attached to the active framebuffer, using default texture", (int)id);
+                RLVK.attachmentFeedbackWarned = true;
+            }
+            id = 0;
+        }
+
+        rlvkTexture *texture = rlvkGetTexture(id);
+        if ((texture == NULL) || (texture->view == VK_NULL_HANDLE) || !texture->sampleable) texture = defaultTexture;
+        if (texture == NULL) return VK_NULL_HANDLE;
+
+        images[i].sampler = texture->sampler;
+        images[i].imageView = texture->view;
+        images[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set,
+            .dstBinding = (uint32_t)i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &images[i]
+        };
+        writes[i] = write;
+    }
+
+    vkUpdateDescriptorSets(RLVK.device, RLVK_MAX_TEXTURE_SLOTS, writes, 0, NULL);
+    return set;
+}
+
+// mvp = clipCorrection * projection * modelview (* transform when required)
+static Matrix rlvkComputeMVP(bool includeTransform)
+{
+    Matrix modelview = RLVK.state.modelview;
+    if (includeTransform && RLVK.state.transformRequired) modelview = MatMul(RLVK.state.transform, modelview);
+    Matrix mvp = MatMul(modelview, RLVK.state.projection);
+    return MatMul(mvp, MatClipCorrection(rlvkTargetFlipsY()));
+}
+
+static void rlvkPushMatrices(VkCommandBuffer cmd, Matrix mvp, Matrix model)
+{
+    float push[32];
+    MatToFloats(mvp, push);
+    MatToFloats(model, push + 16);
+    vkCmdPushConstants(cmd, RLVK.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, RLVK_PUSH_CONSTANT_SIZE, push);
+}
+
+//----------------------------------------------------------------------------------
+// Render batch
+//----------------------------------------------------------------------------------
+static void rlvkResetBatch(void)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+    batch->vertexCount = 0;
+    batch->currentDepth = -1.0f;
+    batch->drawCount = 1;
+    for (int i = 0; i < RL_DEFAULT_BATCH_DRAWCALLS; i++)
+    {
+        batch->draws[i].mode = RL_QUADS;
+        batch->draws[i].vertexCount = 0;
+        batch->draws[i].vertexAlignment = 0;
+        batch->draws[i].textureId = RLVK.defaultTextureId;
+    }
+}
+
+static void rlvkFlushBatch(void)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+    if (batch->vertexCount <= 0)
+    {
+        rlvkResetBatch();
+        return;
+    }
+    if (!rlvkEnsureRecording())
+    {
+        rlvkResetBatch();
+        return;
+    }
+
+    rlvkShader *shader = rlvkGetShader(RLVK.state.currentShaderId);
+    if (shader == NULL)
+    {
+        rlvkResetBatch();
+        return;
+    }
+
+    rlvkBeginRenderPass();
+    if (!RLVK.passActive)
+    {
+        rlvkResetBatch();
+        return;
+    }
+
+    VkCommandBuffer cmd = rlvkCurrentCmd();
+    int vertices = batch->vertexCount;
+
+    rlvkAlloc positions = rlvkFrameAlloc((VkDeviceSize)vertices*3*sizeof(float), 16);
+    rlvkAlloc texcoords = rlvkFrameAlloc((VkDeviceSize)vertices*2*sizeof(float), 16);
+    rlvkAlloc normals = rlvkFrameAlloc((VkDeviceSize)vertices*3*sizeof(float), 16);
+    rlvkAlloc colors = rlvkFrameAlloc((VkDeviceSize)vertices*4, 16);
+    if ((positions.ptr == NULL) || (texcoords.ptr == NULL) || (normals.ptr == NULL) || (colors.ptr == NULL))
+    {
+        TRACELOG(LOG_WARNING, "RLVK: Out of frame vertex memory, batch dropped");
+        rlvkResetBatch();
+        return;
+    }
+
+    memcpy(positions.ptr, batch->positions, (size_t)vertices*3*sizeof(float));
+    memcpy(texcoords.ptr, batch->texcoords, (size_t)vertices*2*sizeof(float));
+    memcpy(normals.ptr, batch->normals, (size_t)vertices*3*sizeof(float));
+    memcpy(colors.ptr, batch->colors, (size_t)vertices*4);
+
+    VkBuffer vertexBuffers[4] = { positions.buffer, texcoords.buffer, normals.buffer, colors.buffer };
+    VkDeviceSize vertexOffsets[4] = { positions.offset, texcoords.offset, normals.offset, colors.offset };
+    vkCmdBindVertexBuffers(cmd, 0, 4, vertexBuffers, vertexOffsets);
+
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, RLVK_BINDING_DEFAULT, 1, &RLVK.defaultAttribBuffer, &zero);
+    vkCmdBindIndexBuffer(cmd, batch->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+    // Batch vertices are already transformed on the CPU (rlgl semantics)
+    Matrix mvp = rlvkComputeMVP(false);
+    rlvkPushMatrices(cmd, mvp, MatIdentity());
+
+    // rlgl sets colDiffuse to white for every batch draw (vertex colors carry the tint);
+    // without this a material tint written by rmodels bleeds into 2D shapes and text
+    const int *locs = (RLVK.state.currentShaderLocs != NULL)? RLVK.state.currentShaderLocs : shader->locs;
+    int colorLoc = locs[SHADER_LOC_COLOR_DIFFUSE];
+    if ((colorLoc >= 0) && (((unsigned int)colorLoc + 16u) <= shader->uboSize))
+    {
+        float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        memcpy(shader->uboShadow + colorLoc, white, sizeof(white));
+    }
+
+    VkDescriptorSet uniformSet = rlvkBuildUniformSet(shader);
+    if (uniformSet != VK_NULL_HANDLE)
+    {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout, 0, 1, &uniformSet, 0, NULL);
+    }
+
+    int vertexOffset = 0;
+    for (int i = 0; i < batch->drawCount; i++)
+    {
+        rlvkDrawCall *draw = &batch->draws[i];
+        if (draw->vertexCount > 0)
+        {
+            rlvkPipelineKey key;
+            rlvkFillPipelineKey(&key, (unsigned int)draw->mode, RLVK_LAYOUT_BATCH, 0x0Fu);
+            VkPipeline pipeline = rlvkGetPipeline(&key);
+            if (pipeline != VK_NULL_HANDLE)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+                VkDescriptorSet textureSet = rlvkBuildTextureSet(draw->textureId);
+                if (textureSet != VK_NULL_HANDLE)
+                {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout, 1, 1, &textureSet, 0, NULL);
+                }
+
+                if ((draw->mode == RL_LINES) || (draw->mode == RL_TRIANGLES))
+                {
+                    vkCmdDraw(cmd, (uint32_t)draw->vertexCount, 1, (uint32_t)vertexOffset, 0);
+                }
+                else
+                {
+                    uint32_t indexCount = (uint32_t)(draw->vertexCount/4*6);
+                    uint32_t firstIndex = (uint32_t)(vertexOffset/4*6);
+                    vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex, 0, 0);
+                }
+            }
+        }
+        vertexOffset += draw->vertexCount + draw->vertexAlignment;
+    }
+
+    rlvkResetBatch();
+}
+
+void rlDrawRenderBatchActive(void)
+{
+    rlvkFlushBatch();
+}
+
+bool rlCheckRenderBatchLimit(int vCount)
+{
+    if ((RLVK.batch.vertexCount + vCount) < (RLVK.batch.elementCount*4)) return false;
+
+    int mode = RLVK.batch.draws[RLVK.batch.drawCount - 1].mode;
+    unsigned int textureId = RLVK.batch.draws[RLVK.batch.drawCount - 1].textureId;
+
+    rlvkFlushBatch();
+
+    RLVK.batch.draws[RLVK.batch.drawCount - 1].mode = mode;
+    RLVK.batch.draws[RLVK.batch.drawCount - 1].textureId = textureId;
+    return true;
+}
+
+//----------------------------------------------------------------------------------
+// Frame lifecycle
+//----------------------------------------------------------------------------------
+static void rlvkCollectPendingCommands(void)
+{
+    for (int i = 0; i < RLVK.pendingCount; )
+    {
+        if (vkGetFenceStatus(RLVK.device, RLVK.pending[i].fence) == VK_SUCCESS)
+        {
+            vkDestroyFence(RLVK.device, RLVK.pending[i].fence, NULL);
+            vkFreeCommandBuffers(RLVK.device, RLVK.transientPool, 1, &RLVK.pending[i].cmd);
+            RLVK.pending[i] = RLVK.pending[RLVK.pendingCount - 1];
+            RLVK.pendingCount--;
+        }
+        else i++;
+    }
+}
+
+// Begin recording the frame command buffer if it is not open yet.
+// NOTE: recording is deliberately decoupled from swapchain acquisition. raylib code may
+// render into a framebuffer BEFORE BeginDrawing() (BeginTextureMode/EndTextureMode
+// outside the frame is an upstream example pattern); that work has to be recorded too.
+static bool rlvkEnsureRecording(void)
+{
+    if (RLVK.frameRecording) return true;
+    if (!RLVK.initialized) return false;
+
+    rlvkFrame *frame = &RLVK.frames[RLVK.frameIndex];
+    vkWaitForFences(RLVK.device, 1, &frame->inFlight, VK_TRUE, UINT64_MAX);
+    vkResetFences(RLVK.device, 1, &frame->inFlight);
+    rlvkCollectPendingCommands();
+
+    rlvkFrameResetAllocator(frame);
+    rlvkFrameResetDescPools(frame);
+    vkResetCommandPool(RLVK.device, frame->cmdPool, 0);
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    vkBeginCommandBuffer(frame->cmd, &beginInfo);
+
+    RLVK.frameRecording = true;
+    RLVK.frameSubmitted = false;
+    RLVK.swapchainAcquired = false;
+    RLVK.acquireWaitPending = false;
+    RLVK.swapchainPassUsed = false;
+    RLVK.skipFrame = false;
+    RLVK.passActive = false;
+    RLVK.activePass = VK_NULL_HANDLE;
+
+    // NOTE: the CPU batch is deliberately NOT reset here - recording can start lazily from
+    // inside rlvkFlushBatch(), and wiping the batch would drop the very geometry that
+    // triggered it. rlvkEndFrame() always flushes, so nothing stale survives a frame.
+    return true;
+}
+
+// Acquire the swapchain image, deferred until the screen target is actually drawn to
+// (or until the frame is presented). Returns false when there is nothing to render into.
+static bool rlvkAcquireSwapchainImage(void)
+{
+    if (RLVK.swapchainAcquired) return true;
+    if (!rlvkEnsureRecording()) return false;
+
+    if (RLVK.swapchainOutOfDate || (RLVK.swapchain == VK_NULL_HANDLE))
+    {
+        rlvkRecreateSwapchain(RLVK.framebufferWidth, RLVK.framebufferHeight);
+    }
+    if (RLVK.swapchain == VK_NULL_HANDLE)
+    {
+        RLVK.skipFrame = true;
+        return false;
+    }
+
+    rlvkFrame *frame = &RLVK.frames[RLVK.frameIndex];
+    VkResult result = vkAcquireNextImageKHR(RLVK.device, RLVK.swapchain, UINT64_MAX,
+                                            frame->imageAvailable, VK_NULL_HANDLE, &RLVK.imageIndex);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR)
+    {
+        rlvkRecreateSwapchain(RLVK.framebufferWidth, RLVK.framebufferHeight);
+        RLVK.skipFrame = true;
+        return false;
+    }
+    if (result == VK_SUBOPTIMAL_KHR) RLVK.swapchainOutOfDate = true;   // Present anyway, recreate next frame
+    else if (result != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "RLVK: Failed to acquire swapchain image (VkResult %i)", (int)result);
+        RLVK.skipFrame = true;
+        return false;
+    }
+
+    // Another frame-in-flight may still be using this image (never our own fence: that
+    // one was already waited on when recording started)
+    VkFence pending = RLVK.imagesInFlight[RLVK.imageIndex];
+    if ((pending != VK_NULL_HANDLE) && (pending != frame->inFlight))
+    {
+        vkWaitForFences(RLVK.device, 1, &pending, VK_TRUE, UINT64_MAX);
+    }
+    RLVK.imagesInFlight[RLVK.imageIndex] = frame->inFlight;
+
+    // Acquired image contents are undefined: discard and move to attachment layouts
+    rlvkTransitionImage(frame->cmd, RLVK.swapchainImages[RLVK.imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, 1, 0, 1);
+    rlvkTransitionImage(frame->cmd, RLVK.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 0, 1, 0, 1);
+
+    RLVK.swapchainAcquired = true;
+    RLVK.acquireWaitPending = true;
+    return true;
+}
+
+void rlvkBeginFrame(void)
+{
+    if (!RLVK.initialized) return;
+
+    rlvkEnsureRecording();
+
+    // BeginDrawing() draws to the screen; the swapchain image itself is acquired lazily
+    if (RLVK.activeTargetFbo == 0)
+    {
+        RLVK.targetWidth = (int)RLVK.swapchainExtent.width;
+        RLVK.targetHeight = (int)RLVK.swapchainExtent.height;
+    }
+}
+
+// End + submit the frame command buffer early (used for readbacks and custom submits),
+// then start recording a fresh one. Always waits for completion.
+static bool rlvkSubmitFrameCommands(bool waitIdle)
+{
+    if (!RLVK.frameRecording) return false;
+
+    rlvkFrame *frame = &RLVK.frames[RLVK.frameIndex];
+    rlvkEndRenderPass();
+    vkEndCommandBuffer(frame->cmd);
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &frame->cmd
+    };
+    if (RLVK.acquireWaitPending)
+    {
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &frame->imageAvailable;
+        submit.pWaitDstStageMask = &waitStage;
+        RLVK.acquireWaitPending = false;
+    }
+    vkQueueSubmit(RLVK.queue, 1, &submit, VK_NULL_HANDLE);
+    RLVK.frameSubmitted = true;
+
+    if (waitIdle) vkQueueWaitIdle(RLVK.queue);
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    vkResetCommandBuffer(frame->cmd, 0);
+    vkBeginCommandBuffer(frame->cmd, &beginInfo);
+    return true;
+}
+
+void rlvkEndFrame(void)
+{
+    if (!RLVK.initialized) return;
+    if (!RLVK.frameRecording)
+    {
+        RLVK.frameIndex = (RLVK.frameIndex + 1)%RLVK_MAX_FRAMES_IN_FLIGHT;
+        return;
+    }
+
+    rlvkFlushBatch();
+
+    // A frame that only rendered into render textures still has to present a screen
+    // image; running the swapchain pass also applies any pending ClearBackground()
+    if (!RLVK.swapchainPassUsed)
+    {
+        rlvkEndRenderPass();
+        RLVK.activeTargetFbo = 0;
+        RLVK.state.activeFramebuffer = 0;
+        rlvkBeginRenderPass();
+    }
+    rlvkEndRenderPass();
+
+    rlvkFrame *frame = &RLVK.frames[RLVK.frameIndex];
+
+    if (RLVK.swapchainAcquired)
+    {
+        VkImage swapImage = RLVK.swapchainImages[RLVK.imageIndex];
+
+        if (RLVK.captureImage != VK_NULL_HANDLE)
+        {
+            // Snapshot the finished frame while we still legally own the image
+            rlvkTransitionImage(frame->cmd, swapImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 1, 0, 1);
+            rlvkTransitionImage(frame->cmd, RLVK.captureImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                RLVK.captureValid? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, 1, 0, 1);
+
+            VkImageCopy copy = {
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .extent = { RLVK.swapchainExtent.width, RLVK.swapchainExtent.height, 1 }
+            };
+            vkCmdCopyImage(frame->cmd, swapImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           RLVK.captureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+            rlvkTransitionImage(frame->cmd, RLVK.captureImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 1, 0, 1);
+            rlvkTransitionImage(frame->cmd, swapImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 1, 0, 1);
+            RLVK.captureValid = true;
+        }
+        else
+        {
+            rlvkTransitionImage(frame->cmd, swapImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 1, 0, 1);
+        }
+    }
+
+    vkEndCommandBuffer(frame->cmd);
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &frame->cmd
+    };
+    if (RLVK.acquireWaitPending)
+    {
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &frame->imageAvailable;
+        submit.pWaitDstStageMask = &waitStage;
+        RLVK.acquireWaitPending = false;
+    }
+    if (RLVK.swapchainAcquired)
+    {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &RLVK.renderFinished[RLVK.imageIndex];
+    }
+
+    VkResult result = vkQueueSubmit(RLVK.queue, 1, &submit, frame->inFlight);
+    if (result != VK_SUCCESS) TRACELOG(LOG_WARNING, "RLVK: Queue submit failed (VkResult %i)", (int)result);
+
+    if (RLVK.swapchainAcquired)
+    {
+        RLVK.presentedImageIndex = RLVK.imageIndex;
+        RLVK.presentedFence = frame->inFlight;
+        RLVK.hasPresented = true;
+
+        VkPresentInfoKHR present = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &RLVK.renderFinished[RLVK.imageIndex],
+            .swapchainCount = 1,
+            .pSwapchains = &RLVK.swapchain,
+            .pImageIndices = &RLVK.imageIndex
+        };
+        result = vkQueuePresentKHR(RLVK.queue, &present);
+        if ((result == VK_ERROR_OUT_OF_DATE_KHR) || (result == VK_SUBOPTIMAL_KHR)) RLVK.swapchainOutOfDate = true;
+        else if (result != VK_SUCCESS) TRACELOG(LOG_WARNING, "RLVK: Present failed (VkResult %i)", (int)result);
+    }
+
+    RLVK.frameRecording = false;
+    RLVK.swapchainAcquired = false;
+    RLVK.passActive = false;
+    RLVK.frameIndex = (RLVK.frameIndex + 1)%RLVK_MAX_FRAMES_IN_FLIGHT;
+}
+
+//----------------------------------------------------------------------------------
+// Matrix stack (rlgl semantics)
+//----------------------------------------------------------------------------------
+void rlMatrixMode(int mode)
+{
+    if (mode == RL_PROJECTION) RLVK.state.currentMatrix = &RLVK.state.projection;
+    else if (mode == RL_MODELVIEW) RLVK.state.currentMatrix = &RLVK.state.modelview;
+    RLVK.state.currentMatrixMode = mode;
+}
+
+void rlPushMatrix(void)
+{
+    if (RLVK.state.stackCounter >= RL_MAX_MATRIX_STACK_SIZE)
+    {
+        TRACELOG(LOG_ERROR, "RLVK: Matrix stack overflow (RL_MAX_MATRIX_STACK_SIZE)");
+        return;
+    }
+
+    if (RLVK.state.currentMatrixMode == RL_MODELVIEW)
+    {
+        RLVK.state.transformRequired = true;
+        RLVK.state.currentMatrix = &RLVK.state.transform;
+    }
+
+    RLVK.state.stack[RLVK.state.stackCounter] = *RLVK.state.currentMatrix;
+    RLVK.state.stackCounter++;
+}
+
+void rlPopMatrix(void)
+{
+    if (RLVK.state.stackCounter > 0)
+    {
+        Matrix mat = RLVK.state.stack[RLVK.state.stackCounter - 1];
+        *RLVK.state.currentMatrix = mat;
+        RLVK.state.stackCounter--;
+    }
+
+    if ((RLVK.state.stackCounter == 0) && (RLVK.state.currentMatrixMode == RL_MODELVIEW))
+    {
+        RLVK.state.currentMatrix = &RLVK.state.modelview;
+        RLVK.state.transformRequired = false;
+    }
+}
+
+void rlLoadIdentity(void)
+{
+    *RLVK.state.currentMatrix = MatIdentity();
+}
+
+void rlTranslatef(float x, float y, float z)
+{
+    *RLVK.state.currentMatrix = MatMul(MatTranslate(x, y, z), *RLVK.state.currentMatrix);
+}
+
+void rlRotatef(float angle, float x, float y, float z)
+{
+    *RLVK.state.currentMatrix = MatMul(MatRotate(x, y, z, angle*DEG2RAD), *RLVK.state.currentMatrix);
+}
+
+void rlScalef(float x, float y, float z)
+{
+    *RLVK.state.currentMatrix = MatMul(MatScale(x, y, z), *RLVK.state.currentMatrix);
+}
+
+void rlMultMatrixf(const float *matf)
+{
+    if (matf == NULL) return;
+    Matrix mat = {
+        matf[0], matf[4], matf[8], matf[12],
+        matf[1], matf[5], matf[9], matf[13],
+        matf[2], matf[6], matf[10], matf[14],
+        matf[3], matf[7], matf[11], matf[15]
+    };
+    *RLVK.state.currentMatrix = MatMul(*RLVK.state.currentMatrix, mat);
+}
+
+void rlFrustum(double left, double right, double bottom, double top, double znear, double zfar)
+{
+    *RLVK.state.currentMatrix = MatMul(*RLVK.state.currentMatrix, MatFrustum(left, right, bottom, top, znear, zfar));
+}
+
+void rlOrtho(double left, double right, double bottom, double top, double znear, double zfar)
+{
+    *RLVK.state.currentMatrix = MatMul(*RLVK.state.currentMatrix, MatOrtho(left, right, bottom, top, znear, zfar));
+}
+
+void rlViewport(int x, int y, int width, int height)
+{
+    // Positive-height viewport: the GL->Vulkan clip correction handles the Y flip (note [1]).
+    // rlgl's viewport origin is bottom-left. For the swapchain (Y-flipped, top-down storage)
+    // that means flipping against the target height; render textures store bottom-up, so
+    // their GL origin already coincides with storage row 0.
+    RLVK.state.viewport.x = (float)x;
+    RLVK.state.viewport.y = rlvkTargetFlipsY()? (float)(RLVK.targetHeight - y - height) : (float)y;
+    RLVK.state.viewport.width = (float)width;
+    RLVK.state.viewport.height = (float)height;
+    RLVK.state.viewport.minDepth = 0.0f;
+    RLVK.state.viewport.maxDepth = 1.0f;
+    if (RLVK.passActive) rlvkSetDynamicState();
+}
+
+void rlSetClipPlanes(double nearPlane, double farPlane)
+{
+    RLVK.cullDistanceNear = nearPlane;
+    RLVK.cullDistanceFar = farPlane;
+}
+
+double rlGetCullDistanceNear(void) { return RLVK.cullDistanceNear; }
+double rlGetCullDistanceFar(void) { return RLVK.cullDistanceFar; }
+
+Matrix rlGetMatrixModelview(void) { return RLVK.state.modelview; }
+Matrix rlGetMatrixProjection(void) { return RLVK.state.projection; }
+Matrix rlGetMatrixTransform(void) { return RLVK.state.transform; }
+
+void rlSetMatrixProjection(Matrix proj) { RLVK.state.projection = proj; }
+void rlSetMatrixModelview(Matrix view) { RLVK.state.modelview = view; }
+
+//----------------------------------------------------------------------------------
+// Immediate mode vertex emission
+//----------------------------------------------------------------------------------
+static int rlvkQuadAlignment(int mode, int vertexCount)
+{
+    if (mode == RL_LINES) return ((vertexCount < 4)? vertexCount : vertexCount%4);
+    if (mode == RL_TRIANGLES) return ((vertexCount < 4)? 1 : (4 - (vertexCount%4)));
+    return 0;
+}
+
+// Close the current draw call and open a new one keeping quad alignment (rlgl behaviour)
+static void rlvkAdvanceDrawCall(void)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+    rlvkDrawCall *draw = &batch->draws[batch->drawCount - 1];
+
+    if (draw->vertexCount > 0)
+    {
+        draw->vertexAlignment = rlvkQuadAlignment(draw->mode, draw->vertexCount);
+        if (!rlCheckRenderBatchLimit(draw->vertexAlignment))
+        {
+            batch->vertexCount += draw->vertexAlignment;
+            batch->drawCount++;
+        }
+    }
+
+    if (batch->drawCount >= RL_DEFAULT_BATCH_DRAWCALLS) rlvkFlushBatch();
+}
+
+void rlBegin(int mode)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+    if (batch->draws[batch->drawCount - 1].mode == mode) { RLVK.state.currentMode = mode; return; }
+
+    rlvkAdvanceDrawCall();
+
+    batch->draws[batch->drawCount - 1].mode = mode;
+    batch->draws[batch->drawCount - 1].vertexCount = 0;
+    batch->draws[batch->drawCount - 1].vertexAlignment = 0;
+    batch->draws[batch->drawCount - 1].textureId = RLVK.defaultTextureId;
+    RLVK.state.currentMode = mode;
+}
+
+void rlEnd(void)
+{
+    // Depth advances towards the near plane so later 2D shapes stay on top (rlgl behaviour).
+    // NOTE: increment depends on rlOrtho() z-near/z-far as set by rcore's SetupViewport()
+    RLVK.batch.currentDepth += (1.0f/20000.0f);
+}
+
+void rlVertex3f(float x, float y, float z)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+    float tx = x, ty = y, tz = z;
+
+    if (RLVK.state.transformRequired)
+    {
+        Matrix t = RLVK.state.transform;
+        tx = t.m0*x + t.m4*y + t.m8*z + t.m12;
+        ty = t.m1*x + t.m5*y + t.m9*z + t.m13;
+        tz = t.m2*x + t.m6*y + t.m10*z + t.m14;
+    }
+
+    // Keep primitives whole when the batch is about to overflow
+    if (batch->vertexCount > (batch->elementCount*4 - 4))
+    {
+        int mode = batch->draws[batch->drawCount - 1].mode;
+        int count = batch->draws[batch->drawCount - 1].vertexCount;
+        if ((mode == RL_LINES) && ((count%2) == 0)) rlCheckRenderBatchLimit(2 + 1);
+        else if ((mode == RL_TRIANGLES) && ((count%3) == 0)) rlCheckRenderBatchLimit(3 + 1);
+        else if ((mode == RL_QUADS) && ((count%4) == 0)) rlCheckRenderBatchLimit(4 + 1);
+    }
+
+    if (batch->vertexCount >= batch->elementCount*4) return;
+
+    int index = batch->vertexCount;
+    batch->positions[index*3 + 0] = tx;
+    batch->positions[index*3 + 1] = ty;
+    batch->positions[index*3 + 2] = tz;
+    batch->texcoords[index*2 + 0] = RLVK.state.texcoordx;
+    batch->texcoords[index*2 + 1] = RLVK.state.texcoordy;
+    batch->normals[index*3 + 0] = RLVK.state.normalx;
+    batch->normals[index*3 + 1] = RLVK.state.normaly;
+    batch->normals[index*3 + 2] = RLVK.state.normalz;
+    batch->colors[index*4 + 0] = RLVK.state.colorr;
+    batch->colors[index*4 + 1] = RLVK.state.colorg;
+    batch->colors[index*4 + 2] = RLVK.state.colorb;
+    batch->colors[index*4 + 3] = RLVK.state.colora;
+
+    batch->vertexCount++;
+    batch->draws[batch->drawCount - 1].vertexCount++;
+}
+
+void rlVertex2f(float x, float y)
+{
+    rlVertex3f(x, y, RLVK.batch.currentDepth);
+}
+
+void rlVertex2i(int x, int y)
+{
+    rlVertex3f((float)x, (float)y, RLVK.batch.currentDepth);
+}
+
+void rlTexCoord2f(float x, float y)
+{
+    RLVK.state.texcoordx = x;
+    RLVK.state.texcoordy = y;
+}
+
+void rlNormal3f(float x, float y, float z)
+{
+    RLVK.state.normalx = x;
+    RLVK.state.normaly = y;
+    RLVK.state.normalz = z;
+}
+
+void rlColor4ub(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
+{
+    RLVK.state.colorr = r;
+    RLVK.state.colorg = g;
+    RLVK.state.colorb = b;
+    RLVK.state.colora = a;
+}
+
+void rlColor3f(float x, float y, float z)
+{
+    rlColor4ub((unsigned char)(x*255), (unsigned char)(y*255), (unsigned char)(z*255), 255);
+}
+
+void rlColor4f(float x, float y, float z, float w)
+{
+    rlColor4ub((unsigned char)(x*255), (unsigned char)(y*255), (unsigned char)(z*255), (unsigned char)(w*255));
+}
+
+void rlSetTexture(unsigned int id)
+{
+    rlvkRenderBatch *batch = &RLVK.batch;
+
+    if (id == 0)
+    {
+        if (batch->vertexCount >= batch->elementCount*4) rlvkFlushBatch();
+        return;
+    }
+
+    if (batch->draws[batch->drawCount - 1].textureId == id) return;
+
+    rlvkAdvanceDrawCall();
+    batch->draws[batch->drawCount - 1].textureId = id;
+    batch->draws[batch->drawCount - 1].vertexCount = 0;
+    batch->draws[batch->drawCount - 1].vertexAlignment = 0;
+}
+
+unsigned int rlGetTextureIdDefault(void) { return RLVK.defaultTextureId; }
+unsigned int rlGetShaderIdDefault(void) { return RLVK.defaultShaderId; }
+int *rlGetShaderLocsDefault(void) { return RLVK.defaultShaderLocs; }
+
+//----------------------------------------------------------------------------------
+// Render state
+//----------------------------------------------------------------------------------
+void rlClearColor(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
+{
+    RLVK.state.clearColor[0] = (float)r/255.0f;
+    RLVK.state.clearColor[1] = (float)g/255.0f;
+    RLVK.state.clearColor[2] = (float)b/255.0f;
+    RLVK.state.clearColor[3] = (float)a/255.0f;
+}
+
+void rlClearScreenBuffers(void)
+{
+    if (RLVK.passActive)
+    {
+        // Mid-pass clear: emit an explicit clear over the whole render area
+        VkClearAttachment attachments[5];
+        uint32_t count = 0;
+        int colorCount = 1;
+        bool hasDepth = true;
+        if (RLVK.activeTargetFbo != 0)
+        {
+            rlvkFramebuffer *fbo = &RLVK.framebuffers[RLVK.activeTargetFbo - 1];
+            colorCount = (fbo->colorCount > 0)? fbo->colorCount : 0;
+            hasDepth = fbo->hasDepth;
+        }
+
+        for (int i = 0; i < colorCount; i++)
+        {
+            attachments[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            attachments[count].colorAttachment = (uint32_t)i;
+            memcpy(attachments[count].clearValue.color.float32, RLVK.state.clearColor, sizeof(RLVK.state.clearColor));
+            count++;
+        }
+        if (hasDepth)
+        {
+            attachments[count].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            attachments[count].colorAttachment = 0;
+            attachments[count].clearValue.depthStencil.depth = RLVK.state.clearDepth;
+            attachments[count].clearValue.depthStencil.stencil = 0;
+            count++;
+        }
+        if (count == 0) return;
+
+        VkClearRect rect = {
+            .rect = { { 0, 0 }, { (uint32_t)RLVK.targetWidth, (uint32_t)RLVK.targetHeight } },
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        };
+        vkCmdClearAttachments(rlvkCurrentCmd(), count, attachments, 1, &rect);
+        return;
+    }
+
+    if (RLVK.activeTargetFbo == 0) RLVK.state.swapchainClearPending = true;
+    else RLVK.framebuffers[RLVK.activeTargetFbo - 1].clearPending = true;
+}
+
+void rlEnableDepthTest(void) { rlvkFlushBatch(); RLVK.state.depthTest = true; }
+void rlDisableDepthTest(void) { rlvkFlushBatch(); RLVK.state.depthTest = false; }
+void rlEnableDepthMask(void) { rlvkFlushBatch(); RLVK.state.depthMask = true; }
+void rlDisableDepthMask(void) { rlvkFlushBatch(); RLVK.state.depthMask = false; }
+void rlEnableBackfaceCulling(void) { rlvkFlushBatch(); RLVK.state.cullEnable = true; }
+void rlDisableBackfaceCulling(void) { rlvkFlushBatch(); RLVK.state.cullEnable = false; }
+
+void rlSetCullFace(int mode)
+{
+    rlvkFlushBatch();
+    RLVK.state.cullMode = (mode == 0)? 0 : 1;
+}
+
+void rlEnableWireMode(void)
+{
+    rlvkFlushBatch();
+    if (!RLVK.wireSupported)
+    {
+        TRACELOG(LOG_WARNING, "RLVK: Wire mode not supported by device (fillModeNonSolid)");
+        return;
+    }
+    RLVK.state.wireMode = true;
+    RLVK.state.pointMode = false;
+}
+
+void rlEnablePointMode(void)
+{
+    rlvkFlushBatch();
+    RLVK.state.pointMode = true;
+    RLVK.state.wireMode = false;
+}
+
+void rlDisableWireMode(void)
+{
+    rlvkFlushBatch();
+    RLVK.state.wireMode = false;
+    RLVK.state.pointMode = false;
+}
+
+void rlSetLineWidth(float width)
+{
+    if (width <= 0.0f) width = 1.0f;
+    rlvkFlushBatch();
+    RLVK.state.lineWidth = width;
+    if (RLVK.passActive) rlvkSetDynamicState();
+}
+
+float rlGetLineWidth(void) { return RLVK.state.lineWidth; }
+
+void rlEnableSmoothLines(void)
+{
+    // Vulkan core has no line smoothing (VK_EXT_line_rasterization not required here)
+    TRACELOG(LOG_WARNING, "RLVK: Smooth lines not supported on Vulkan backend");
+}
+
+void rlDisableSmoothLines(void) { }
+
+void rlEnableColorBlend(void) { rlvkFlushBatch(); RLVK.state.blendEnable = true; }
+void rlDisableColorBlend(void) { rlvkFlushBatch(); RLVK.state.blendEnable = false; }
+
+void rlSetBlendMode(int mode)
+{
+    if (RLVK.state.blendMode == mode) return;
+    rlvkFlushBatch();
+    RLVK.state.blendMode = mode;
+
+    switch (mode)
+    {
+        case BLEND_ALPHA:
+        {
+            RLVK.state.blendSrcRGB = RLVK_GL_SRC_ALPHA; RLVK.state.blendDstRGB = RLVK_GL_ONE_MINUS_SRC_ALPHA;
+            RLVK.state.blendSrcAlpha = RLVK_GL_SRC_ALPHA; RLVK.state.blendDstAlpha = RLVK_GL_ONE_MINUS_SRC_ALPHA;
+            RLVK.state.blendEqRGB = RLVK_GL_FUNC_ADD; RLVK.state.blendEqAlpha = RLVK_GL_FUNC_ADD;
+        } break;
+        case BLEND_ADDITIVE:
+        {
+            RLVK.state.blendSrcRGB = RLVK_GL_SRC_ALPHA; RLVK.state.blendDstRGB = RLVK_GL_ONE;
+            RLVK.state.blendSrcAlpha = RLVK_GL_SRC_ALPHA; RLVK.state.blendDstAlpha = RLVK_GL_ONE;
+            RLVK.state.blendEqRGB = RLVK_GL_FUNC_ADD; RLVK.state.blendEqAlpha = RLVK_GL_FUNC_ADD;
+        } break;
+        case BLEND_MULTIPLIED:
+        {
+            RLVK.state.blendSrcRGB = RLVK_GL_DST_COLOR; RLVK.state.blendDstRGB = RLVK_GL_ONE_MINUS_SRC_ALPHA;
+            RLVK.state.blendSrcAlpha = RLVK_GL_DST_COLOR; RLVK.state.blendDstAlpha = RLVK_GL_ONE_MINUS_SRC_ALPHA;
+            RLVK.state.blendEqRGB = RLVK_GL_FUNC_ADD; RLVK.state.blendEqAlpha = RLVK_GL_FUNC_ADD;
+        } break;
+        case BLEND_ADD_COLORS:
+        {
+            RLVK.state.blendSrcRGB = RLVK_GL_ONE; RLVK.state.blendDstRGB = RLVK_GL_ONE;
+            RLVK.state.blendSrcAlpha = RLVK_GL_ONE; RLVK.state.blendDstAlpha = RLVK_GL_ONE;
+            RLVK.state.blendEqRGB = RLVK_GL_FUNC_ADD; RLVK.state.blendEqAlpha = RLVK_GL_FUNC_ADD;
+        } break;
+        case BLEND_SUBTRACT_COLORS:
+        {
+            RLVK.state.blendSrcRGB = RLVK_GL_ONE; RLVK.state.blendDstRGB = RLVK_GL_ONE;
+            RLVK.state.blendSrcAlpha = RLVK_GL_ONE; RLVK.state.blendDstAlpha = RLVK_GL_ONE;
+            RLVK.state.blendEqRGB = RLVK_GL_FUNC_SUBTRACT; RLVK.state.blendEqAlpha = RLVK_GL_FUNC_SUBTRACT;
+        } break;
+        case BLEND_ALPHA_PREMULTIPLY:
+        {
+            RLVK.state.blendSrcRGB = RLVK_GL_ONE; RLVK.state.blendDstRGB = RLVK_GL_ONE_MINUS_SRC_ALPHA;
+            RLVK.state.blendSrcAlpha = RLVK_GL_ONE; RLVK.state.blendDstAlpha = RLVK_GL_ONE_MINUS_SRC_ALPHA;
+            RLVK.state.blendEqRGB = RLVK_GL_FUNC_ADD; RLVK.state.blendEqAlpha = RLVK_GL_FUNC_ADD;
+        } break;
+        case BLEND_CUSTOM:
+        case BLEND_CUSTOM_SEPARATE: break;   // Factors already set by rlSetBlendFactors*
+        default: break;
+    }
+}
+
+void rlSetBlendFactors(int srcFactor, int dstFactor, int equation)
+{
+    rlvkFlushBatch();
+    RLVK.state.blendSrcRGB = (unsigned int)srcFactor;
+    RLVK.state.blendDstRGB = (unsigned int)dstFactor;
+    RLVK.state.blendSrcAlpha = (unsigned int)srcFactor;
+    RLVK.state.blendDstAlpha = (unsigned int)dstFactor;
+    RLVK.state.blendEqRGB = (unsigned int)equation;
+    RLVK.state.blendEqAlpha = (unsigned int)equation;
+}
+
+void rlSetBlendFactorsSeparate(int srcRGB, int dstRGB, int srcAlpha, int dstAlpha, int eqRGB, int eqAlpha)
+{
+    rlvkFlushBatch();
+    RLVK.state.blendSrcRGB = (unsigned int)srcRGB;
+    RLVK.state.blendDstRGB = (unsigned int)dstRGB;
+    RLVK.state.blendSrcAlpha = (unsigned int)srcAlpha;
+    RLVK.state.blendDstAlpha = (unsigned int)dstAlpha;
+    RLVK.state.blendEqRGB = (unsigned int)eqRGB;
+    RLVK.state.blendEqAlpha = (unsigned int)eqAlpha;
+}
+
+void rlEnableScissorTest(void)
+{
+    rlvkFlushBatch();
+    RLVK.state.scissorTest = true;
+    if (RLVK.passActive) rlvkSetDynamicState();
+}
+
+void rlDisableScissorTest(void)
+{
+    rlvkFlushBatch();
+    RLVK.state.scissorTest = false;
+    if (RLVK.passActive) rlvkSetDynamicState();
+}
+
+void rlScissor(int x, int y, int width, int height)
+{
+    rlvkFlushBatch();
+    if (width < 0) width = 0;
+    if (height < 0) height = 0;
+
+    // rlgl scissor origin is bottom-left; Vulkan is top-left. Render textures store
+    // bottom-up, so their rows already match GL's origin (see MatClipCorrection)
+    int top = rlvkTargetFlipsY()? (RLVK.targetHeight - y - height) : y;
+    if (top < 0) top = 0;
+    if (x < 0) x = 0;
+
+    RLVK.state.scissor.offset.x = x;
+    RLVK.state.scissor.offset.y = top;
+    RLVK.state.scissor.extent.width = (uint32_t)width;
+    RLVK.state.scissor.extent.height = (uint32_t)height;
+    if (RLVK.passActive) rlvkSetDynamicState();
+}
+
+int rlGetFramebufferWidth(void) { return RLVK.framebufferWidth; }
+int rlGetFramebufferHeight(void) { return RLVK.framebufferHeight; }
+void rlSetFramebufferWidth(int width) { RLVK.framebufferWidth = width; }
+void rlSetFramebufferHeight(int height) { RLVK.framebufferHeight = height; }
+
+//----------------------------------------------------------------------------------
+// Framebuffers (render textures)
+//----------------------------------------------------------------------------------
+#define RLVK_GL_READ_FRAMEBUFFER    0x8CA8
+#define RLVK_GL_DRAW_FRAMEBUFFER    0x8CA9
+
+static rlvkFramebuffer *rlvkGetFramebuffer(unsigned int id)
+{
+    if ((id == 0) || ((int)id > RLVK.framebufferCapacity)) return NULL;
+    rlvkFramebuffer *fbo = &RLVK.framebuffers[id - 1];
+    if (!fbo->used) return NULL;
+    return fbo;
+}
+
+unsigned int rlLoadFramebuffer(void)
+{
+    for (int i = 0; i < RLVK.framebufferCapacity; i++)
+    {
+        if (!RLVK.framebuffers[i].used)
+        {
+            memset(&RLVK.framebuffers[i], 0, sizeof(rlvkFramebuffer));
+            RLVK.framebuffers[i].used = true;
+            RLVK.framebuffers[i].activeDrawBuffers = 1;
+            return (unsigned int)(i + 1);
+        }
+    }
+
+    int newCapacity = (RLVK.framebufferCapacity == 0)? 8 : RLVK.framebufferCapacity*2;
+    rlvkFramebuffer *grown = (rlvkFramebuffer *)RL_REALLOC(RLVK.framebuffers, (size_t)newCapacity*sizeof(rlvkFramebuffer));
+    if (grown == NULL) return 0;
+    memset(&grown[RLVK.framebufferCapacity], 0, (size_t)(newCapacity - RLVK.framebufferCapacity)*sizeof(rlvkFramebuffer));
+    RLVK.framebuffers = grown;
+
+    int index = RLVK.framebufferCapacity;
+    RLVK.framebufferCapacity = newCapacity;
+    RLVK.framebuffers[index].used = true;
+    RLVK.framebuffers[index].activeDrawBuffers = 1;
+    return (unsigned int)(index + 1);
+}
+
+void rlFramebufferAttach(unsigned int fboId, unsigned int texId, int attachType, int texType, int mipLevel)
+{
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(fboId);
+    rlvkTexture *texture = rlvkGetTexture(texId);
+    if ((fbo == NULL) || (texture == NULL))
+    {
+        TRACELOG(LOG_WARNING, "FBO: [ID %i] Invalid framebuffer or texture for attachment", (int)fboId);
+        return;
+    }
+
+    if ((attachType >= RL_ATTACHMENT_COLOR_CHANNEL0) && (attachType <= RL_ATTACHMENT_COLOR_CHANNEL3))
+    {
+        fbo->color[attachType].texId = texId;
+        fbo->color[attachType].texType = texType;
+        fbo->color[attachType].mipLevel = mipLevel;
+        if ((attachType + 1) > fbo->colorCount) fbo->colorCount = attachType + 1;
+    }
+    else if ((attachType == RL_ATTACHMENT_DEPTH) || (attachType == RL_ATTACHMENT_STENCIL))
+    {
+        fbo->depth.texId = texId;
+        fbo->depth.texType = texType;
+        fbo->depth.mipLevel = mipLevel;
+        fbo->hasDepth = true;
+    }
+    else
+    {
+        TRACELOG(LOG_WARNING, "FBO: [ID %i] Unsupported attachment type %i", (int)fboId, attachType);
+        return;
+    }
+
+    fbo->width = texture->width;
+    fbo->height = texture->height;
+    fbo->complete = false;
+}
+
+// Create the attachment-specific image view (mip level / cubemap face)
+static VkImageView rlvkCreateAttachmentView(const rlvkFboAttachment *attachment, bool depth)
+{
+    rlvkTexture *texture = rlvkGetTexture(attachment->texId);
+    if (texture == NULL) return VK_NULL_HANDLE;
+
+    uint32_t baseLayer = 0;
+    if ((attachment->texType >= RL_ATTACHMENT_CUBEMAP_POSITIVE_X) && (attachment->texType <= RL_ATTACHMENT_CUBEMAP_NEGATIVE_Z))
+    {
+        baseLayer = (uint32_t)attachment->texType;
+    }
+
+    uint32_t mipLevel = (uint32_t)((attachment->mipLevel > 0)? attachment->mipLevel : 0);
+    if (mipLevel >= (uint32_t)texture->mipmaps) mipLevel = 0;
+
+    VkImageViewCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = texture->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = texture->vkFormat,
+        .subresourceRange = {
+            .aspectMask = depth? texture->aspect : VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = mipLevel,
+            .levelCount = 1,
+            .baseArrayLayer = baseLayer,
+            .layerCount = 1
+        }
+    };
+
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(RLVK.device, &info, NULL, &view) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "FBO: Failed to create attachment image view");
+        return VK_NULL_HANDLE;
+    }
+    return view;
+}
+
+bool rlFramebufferComplete(unsigned int id)
+{
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(id);
+    if (fbo == NULL) return false;
+    if (fbo->complete) return true;
+    if ((fbo->colorCount == 0) && !fbo->hasDepth)
+    {
+        TRACELOG(LOG_WARNING, "FBO: [ID %i] Framebuffer has no attachments", (int)id);
+        return false;
+    }
+
+    VkImageView views[5];
+    VkFormat colorFormats[4];
+    uint32_t viewCount = 0;
+
+    for (int i = 0; i < fbo->colorCount; i++)
+    {
+        rlvkTexture *texture = rlvkGetTexture(fbo->color[i].texId);
+        if (texture == NULL)
+        {
+            TRACELOG(LOG_WARNING, "FBO: [ID %i] Color attachment %i missing", (int)id, i);
+            return false;
+        }
+        if (fbo->color[i].view == VK_NULL_HANDLE) fbo->color[i].view = rlvkCreateAttachmentView(&fbo->color[i], false);
+        if (fbo->color[i].view == VK_NULL_HANDLE) return false;
+        views[viewCount++] = fbo->color[i].view;
+        colorFormats[i] = texture->vkFormat;
+    }
+
+    if (fbo->hasDepth)
+    {
+        if (fbo->depth.view == VK_NULL_HANDLE) fbo->depth.view = rlvkCreateAttachmentView(&fbo->depth, true);
+        if (fbo->depth.view == VK_NULL_HANDLE) return false;
+        views[viewCount++] = fbo->depth.view;
+    }
+
+    if (fbo->passClear == VK_NULL_HANDLE)
+    {
+        if (!rlvkCreateRenderPasses(VK_FORMAT_UNDEFINED, fbo->colorCount, fbo->hasDepth,
+                                    &fbo->passClear, &fbo->passLoad, colorFormats)) return false;
+    }
+
+    VkFramebufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = fbo->passClear,
+        .attachmentCount = viewCount,
+        .pAttachments = views,
+        .width = (uint32_t)fbo->width,
+        .height = (uint32_t)fbo->height,
+        .layers = 1
+    };
+    if (vkCreateFramebuffer(RLVK.device, &info, NULL, &fbo->framebuffer) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "FBO: [ID %i] Failed to create Vulkan framebuffer", (int)id);
+        return false;
+    }
+
+    fbo->complete = true;
+    TRACELOG(LOG_INFO, "FBO: [ID %i] Framebuffer object created successfully (%ix%i)", (int)id, fbo->width, fbo->height);
+    return true;
+}
+
+void rlUnloadFramebuffer(unsigned int id)
+{
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(id);
+    if (fbo == NULL) return;
+
+    rlvkFlushBeforeDestroy();
+
+    int keptPipelines = RLVK.pipelineCount;
+    for (int i = 0; i < RLVK.pipelineCount; )
+    {
+        unsigned long long passClear = (unsigned long long)(uintptr_t)fbo->passClear;
+        unsigned long long passLoad = (unsigned long long)(uintptr_t)fbo->passLoad;
+        if ((RLVK.pipelines[i].key.renderPass == passClear) || (RLVK.pipelines[i].key.renderPass == passLoad))
+        {
+            vkDestroyPipeline(RLVK.device, RLVK.pipelines[i].pipeline, NULL);
+            RLVK.pipelines[i] = RLVK.pipelines[RLVK.pipelineCount - 1];
+            RLVK.pipelineCount--;
+        }
+        else i++;
+    }
+    if (RLVK.pipelineCount != keptPipelines) rlvkPipelineIndexRebuild(RLVK.pipelineSlotCount);
+
+    if (fbo->framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(RLVK.device, fbo->framebuffer, NULL);
+    if (fbo->passClear != VK_NULL_HANDLE) vkDestroyRenderPass(RLVK.device, fbo->passClear, NULL);
+    if (fbo->passLoad != VK_NULL_HANDLE) vkDestroyRenderPass(RLVK.device, fbo->passLoad, NULL);
+    for (int i = 0; i < 4; i++)
+    {
+        if (fbo->color[i].view != VK_NULL_HANDLE) vkDestroyImageView(RLVK.device, fbo->color[i].view, NULL);
+    }
+    if (fbo->depth.view != VK_NULL_HANDLE) vkDestroyImageView(RLVK.device, fbo->depth.view, NULL);
+    memset(fbo, 0, sizeof(*fbo));
+
+    if (RLVK.state.activeFramebuffer == id) rlDisableFramebuffer();
+}
+
+void rlEnableFramebuffer(unsigned int id)
+{
+    if (RLVK.state.activeFramebuffer == id) return;
+
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(id);
+    if (fbo == NULL)
+    {
+        if (id != 0) TRACELOG(LOG_WARNING, "FBO: [ID %i] Cannot enable unknown framebuffer", (int)id);
+        return;
+    }
+    // Binding before attachments are set is valid usage (GL bind-then-attach pattern):
+    // the target switch is deferred until the framebuffer is complete
+    if (!fbo->complete) return;
+
+    // Pending batch belongs to the PREVIOUS target: flush it before switching
+    rlvkFlushBatch();
+    rlvkEndRenderPass();
+
+    RLVK.state.activeFramebuffer = id;
+    RLVK.activeTargetFbo = id;
+    RLVK.targetWidth = fbo->width;
+    RLVK.targetHeight = fbo->height;
+
+    RLVK.state.viewport.x = 0.0f;
+    RLVK.state.viewport.y = 0.0f;
+    RLVK.state.viewport.width = (float)fbo->width;
+    RLVK.state.viewport.height = (float)fbo->height;
+    RLVK.state.viewport.minDepth = 0.0f;
+    RLVK.state.viewport.maxDepth = 1.0f;
+    RLVK.state.scissor.offset.x = 0;
+    RLVK.state.scissor.offset.y = 0;
+    RLVK.state.scissor.extent.width = (uint32_t)fbo->width;
+    RLVK.state.scissor.extent.height = (uint32_t)fbo->height;
+}
+
+void rlDisableFramebuffer(void)
+{
+    if (RLVK.state.activeFramebuffer == 0) return;
+
+    // Pending batch still targets the framebuffer: flush it before the pass ends
+    rlvkFlushBatch();
+    rlvkEndRenderPass();
+
+    RLVK.state.activeFramebuffer = 0;
+    RLVK.activeTargetFbo = 0;
+    RLVK.targetWidth = (int)RLVK.swapchainExtent.width;
+    RLVK.targetHeight = (int)RLVK.swapchainExtent.height;
+
+    RLVK.state.viewport.x = 0.0f;
+    RLVK.state.viewport.y = 0.0f;
+    RLVK.state.viewport.width = (float)RLVK.swapchainExtent.width;
+    RLVK.state.viewport.height = (float)RLVK.swapchainExtent.height;
+    RLVK.state.viewport.minDepth = 0.0f;
+    RLVK.state.viewport.maxDepth = 1.0f;
+    RLVK.state.scissor.offset.x = 0;
+    RLVK.state.scissor.offset.y = 0;
+    RLVK.state.scissor.extent = RLVK.swapchainExtent;
+}
+
+void rlBindFramebuffer(unsigned int target, unsigned int framebuffer)
+{
+    if (target == RLVK_GL_READ_FRAMEBUFFER) RLVK.state.readFramebuffer = framebuffer;
+    else if (target == RLVK_GL_DRAW_FRAMEBUFFER)
+    {
+        if (framebuffer == 0) rlDisableFramebuffer();
+        else rlEnableFramebuffer(framebuffer);
+    }
+    else
+    {
+        RLVK.state.readFramebuffer = framebuffer;
+        if (framebuffer == 0) rlDisableFramebuffer();
+        else rlEnableFramebuffer(framebuffer);
+    }
+}
+
+unsigned int rlGetActiveFramebuffer(void) { return RLVK.state.activeFramebuffer; }
+
+void rlActiveDrawBuffers(int count)
+{
+    if (RLVK.state.activeFramebuffer == 0) return;
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(RLVK.state.activeFramebuffer);
+    if (fbo == NULL) return;
+    if (count < 1) count = 1;
+    if (count > fbo->colorCount) count = fbo->colorCount;
+    fbo->activeDrawBuffers = count;
+}
+
+// Resolve one blit endpoint: the swapchain (fbo id 0) or a framebuffer attachment.
+// Returns false when the requested aspect is not present on that target.
+static bool rlvkResolveBlitTarget(unsigned int fboId, bool depth, VkImage *outImage,
+                                  VkFormat *outFormat, rlvkTexture **outTexture)
+{
+    *outTexture = NULL;
+
+    if (fboId == 0)
+    {
+        if (!rlvkAcquireSwapchainImage()) return false;
+        *outImage = depth? RLVK.depthImage : RLVK.swapchainImages[RLVK.imageIndex];
+        *outFormat = depth? RLVK.depthFormat : RLVK.swapchainFormat;
+        return (*outImage != VK_NULL_HANDLE);
+    }
+
+    rlvkFramebuffer *fbo = rlvkGetFramebuffer(fboId);
+    if (fbo == NULL) return false;
+
+    rlvkTexture *texture = NULL;
+    if (depth)
+    {
+        if (!fbo->hasDepth) return false;
+        texture = rlvkGetTexture(fbo->depth.texId);
+    }
+    else
+    {
+        if (fbo->colorCount == 0) return false;
+        texture = rlvkGetTexture(fbo->color[0].texId);
+    }
+    if (texture == NULL) return false;
+
+    *outImage = texture->image;
+    *outFormat = texture->vkFormat;
+    *outTexture = texture;
+    return true;
+}
+
+// Layout a blit endpoint returns to once the copy is done
+static VkImageLayout rlvkBlitRestoreLayout(const rlvkTexture *texture, bool depth)
+{
+    if (texture == NULL) return depth? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (texture->sampleable) return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return depth? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
+
+// Blit (or copy) one aspect between the bound read and draw framebuffers
+static void rlvkBlitAspect(bool depth, int srcX, int srcY, int srcWidth, int srcHeight,
+                           int dstX, int dstY, int dstWidth, int dstHeight)
+{
+    VkImage srcImage = VK_NULL_HANDLE, dstImage = VK_NULL_HANDLE;
+    VkFormat srcFormat = VK_FORMAT_UNDEFINED, dstFormat = VK_FORMAT_UNDEFINED;
+    rlvkTexture *srcTexture = NULL, *dstTexture = NULL;
+
+    if (!rlvkResolveBlitTarget(RLVK.state.readFramebuffer, depth, &srcImage, &srcFormat, &srcTexture)) return;
+    if (!rlvkResolveBlitTarget(RLVK.state.activeFramebuffer, depth, &dstImage, &dstFormat, &dstTexture)) return;
+    if ((srcImage == VK_NULL_HANDLE) || (dstImage == VK_NULL_HANDLE) || (srcImage == dstImage)) return;
+
+    // Depth/stencil aspects can only be transferred between identical formats
+    if (depth && (srcFormat != dstFormat))
+    {
+        TRACELOG(LOG_WARNING, "FBO: Depth blit needs matching formats (src %i, dst %i)", (int)srcFormat, (int)dstFormat);
+        return;
+    }
+
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    if (depth)
+    {
+        aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+        if ((srcTexture != NULL) && ((srcTexture->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) &&
+            (dstTexture == NULL || ((dstTexture->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0)))
+        {
+            aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+    }
+
+    VkCommandBuffer cmd = rlvkCurrentCmd();
+    VkImageLayout srcOld = (srcTexture != NULL)? srcTexture->layout
+                         : (depth? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkImageLayout dstOld = (dstTexture != NULL)? dstTexture->layout
+                         : (depth? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    rlvkTransitionImage(cmd, srcImage, aspect, srcOld, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 1, 0, 1);
+    rlvkTransitionImage(cmd, dstImage, aspect, dstOld, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, 1, 0, 1);
+
+    // vkCmdBlitImage cannot scale depth/stencil, so equal-sized regions use a plain copy
+    bool sameSize = ((srcWidth == dstWidth) && (srcHeight == dstHeight));
+    if (depth || sameSize)
+    {
+        if (!sameSize)
+        {
+            TRACELOG(LOG_WARNING, "FBO: Depth blit cannot scale, copying the overlapping region");
+            if (dstWidth < srcWidth) srcWidth = dstWidth;
+            if (dstHeight < srcHeight) srcHeight = dstHeight;
+        }
+
+        VkImageCopy copy = {
+            .srcSubresource = { aspect, 0, 0, 1 },
+            .srcOffset = { srcX, srcY, 0 },
+            .dstSubresource = { aspect, 0, 0, 1 },
+            .dstOffset = { dstX, dstY, 0 },
+            .extent = { (uint32_t)((srcWidth > 0)? srcWidth : 0), (uint32_t)((srcHeight > 0)? srcHeight : 0), 1 }
+        };
+        if ((copy.extent.width > 0) && (copy.extent.height > 0))
+        {
+            vkCmdCopyImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        }
+    }
+    else
+    {
+        VkImageBlit blit = {
+            .srcSubresource = { aspect, 0, 0, 1 },
+            .dstSubresource = { aspect, 0, 0, 1 }
+        };
+        blit.srcOffsets[0].x = srcX; blit.srcOffsets[0].y = srcY; blit.srcOffsets[0].z = 0;
+        blit.srcOffsets[1].x = srcX + srcWidth; blit.srcOffsets[1].y = srcY + srcHeight; blit.srcOffsets[1].z = 1;
+        blit.dstOffsets[0].x = dstX; blit.dstOffsets[0].y = dstY; blit.dstOffsets[0].z = 0;
+        blit.dstOffsets[1].x = dstX + dstWidth; blit.dstOffsets[1].y = dstY + dstHeight; blit.dstOffsets[1].z = 1;
+        vkCmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+
+    VkImageLayout srcRestore = rlvkBlitRestoreLayout(srcTexture, depth);
+    VkImageLayout dstRestore = rlvkBlitRestoreLayout(dstTexture, depth);
+    rlvkTransitionImage(cmd, srcImage, aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcRestore, 0, 1, 0, 1);
+    rlvkTransitionImage(cmd, dstImage, aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstRestore, 0, 1, 0, 1);
+    if (srcTexture != NULL) srcTexture->layout = srcRestore;
+    if (dstTexture != NULL) dstTexture->layout = dstRestore;
+}
+
+void rlBlitFramebuffer(int srcX, int srcY, int srcWidth, int srcHeight,
+                       int dstX, int dstY, int dstWidth, int dstHeight, int bufferMask)
+{
+    bool color = ((bufferMask & RLVK_GL_COLOR_BUFFER_BIT) != 0);
+    bool depth = ((bufferMask & RLVK_GL_DEPTH_BUFFER_BIT) != 0);
+    if (!color && !depth) return;
+    if (!rlvkEnsureRecording()) return;
+
+    rlvkFlushBatch();
+    rlvkEndRenderPass();
+
+    if (color) rlvkBlitAspect(false, srcX, srcY, srcWidth, srcHeight, dstX, dstY, dstWidth, dstHeight);
+    if (depth) rlvkBlitAspect(true, srcX, srcY, srcWidth, srcHeight, dstX, dstY, dstWidth, dstHeight);
+}
+
+unsigned char *rlReadScreenPixels(int width, int height)
+{
+    if (!RLVK.initialized || (RLVK.swapchain == VK_NULL_HANDLE)) return NULL;
+    if ((width <= 0) || (height <= 0)) return NULL;
+    if (width > (int)RLVK.swapchainExtent.width) width = (int)RLVK.swapchainExtent.width;
+    if (height > (int)RLVK.swapchainExtent.height) height = (int)RLVK.swapchainExtent.height;
+
+    // Two call sites, two sources:
+    //  - mid-frame (rcore TakeScreenshot inside EndDrawing): flush + split-submit the
+    //    frame commands, then read the image being rendered (COLOR_ATTACHMENT layout)
+    //  - between frames (LoadImageFromScreen): read the last PRESENTED image, waiting on
+    //    the fence of the frame that rendered it so the copy sees finished work
+    VkImage image = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    if (RLVK.frameRecording && RLVK.swapchainAcquired)
+    {
+        rlvkFlushBatch();
+        rlvkSubmitFrameCommands(true);
+        image = RLVK.swapchainImages[RLVK.imageIndex];
+        layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    else if (RLVK.hasPresented && RLVK.captureValid)
+    {
+        if (RLVK.presentedFence != VK_NULL_HANDLE)
+        {
+            vkWaitForFences(RLVK.device, 1, &RLVK.presentedFence, VK_TRUE, UINT64_MAX);
+        }
+        image = RLVK.captureImage;
+        layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
+    else
+    {
+        TRACELOG(LOG_WARNING, "RLVK: No completed frame available to read screen pixels from");
+        return NULL;
+    }
+    if (image == VK_NULL_HANDLE) return NULL;
+
+    VkDeviceSize size = (VkDeviceSize)width*height*4;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    unsigned char *mapped = NULL;
+    if (!rlvkCreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &stagingMemory, &mapped)) return NULL;
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd == VK_NULL_HANDLE)
+    {
+        rlvkDestroyBufferObject(staging, stagingMemory, true);
+        return NULL;
+    }
+    rlvkTransitionImage(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 1, 0, 1);
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t)width, (uint32_t)height, 1 }
+    };
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &region);
+    if (layout != VK_IMAGE_LAYOUT_UNDEFINED)
+    {
+        rlvkTransitionImage(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout, 0, 1, 0, 1);
+    }
+    rlvkEndOneShot(cmd);
+
+    unsigned char *pixels = (unsigned char *)RL_MALLOC((size_t)size);
+    if (pixels != NULL)
+    {
+        bool swapRB = (RLVK.swapchainFormat == VK_FORMAT_B8G8R8A8_UNORM) || (RLVK.swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB);
+        for (int i = 0; i < width*height; i++)
+        {
+            unsigned char r = mapped[i*4 + (swapRB? 2 : 0)];
+            unsigned char g = mapped[i*4 + 1];
+            unsigned char b = mapped[i*4 + (swapRB? 0 : 2)];
+            pixels[i*4 + 0] = r;
+            pixels[i*4 + 1] = g;
+            pixels[i*4 + 2] = b;
+            pixels[i*4 + 3] = 255;
+        }
+    }
+
+    rlvkDestroyBufferObject(staging, stagingMemory, true);
+    return pixels;
+}
+
+//----------------------------------------------------------------------------------
+// Mesh vertex buffers
+//----------------------------------------------------------------------------------
+static rlvkBuffer *rlvkGetBuffer(unsigned int id)
+{
+    if ((id == 0) || ((int)id > RLVK.bufferCapacity)) return NULL;
+    rlvkBuffer *buffer = &RLVK.buffers[id - 1];
+    if (!buffer->used) return NULL;
+    return buffer;
+}
+
+static unsigned int rlvkAllocBufferSlot(void)
+{
+    for (int i = 0; i < RLVK.bufferCapacity; i++)
+    {
+        if (!RLVK.buffers[i].used)
+        {
+            memset(&RLVK.buffers[i], 0, sizeof(rlvkBuffer));
+            RLVK.buffers[i].used = true;
+            return (unsigned int)(i + 1);
+        }
+    }
+
+    int newCapacity = (RLVK.bufferCapacity == 0)? 64 : RLVK.bufferCapacity*2;
+    rlvkBuffer *grown = (rlvkBuffer *)RL_REALLOC(RLVK.buffers, (size_t)newCapacity*sizeof(rlvkBuffer));
+    if (grown == NULL) return 0;
+    memset(&grown[RLVK.bufferCapacity], 0, (size_t)(newCapacity - RLVK.bufferCapacity)*sizeof(rlvkBuffer));
+    RLVK.buffers = grown;
+
+    int index = RLVK.bufferCapacity;
+    RLVK.bufferCapacity = newCapacity;
+    RLVK.buffers[index].used = true;
+    return (unsigned int)(index + 1);
+}
+
+static unsigned int rlvkLoadBuffer(const void *data, int size, bool dynamic, bool isIndex)
+{
+    if (size <= 0) return 0;
+
+    unsigned int id = rlvkAllocBufferSlot();
+    if (id == 0) return 0;
+
+    rlvkBuffer *buffer = &RLVK.buffers[id - 1];
+    buffer->size = (VkDeviceSize)size;
+    buffer->dynamic = dynamic;
+    buffer->isIndex = isIndex;
+
+    VkBufferUsageFlags usage = isIndex? VK_BUFFER_USAGE_INDEX_BUFFER_BIT : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+
+    bool ok = false;
+    if (dynamic)
+    {
+        ok = rlvkCreateBuffer(buffer->size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              &buffer->buffer, &buffer->memory, &buffer->mapped);
+        if (ok && (data != NULL) && (buffer->mapped != NULL)) memcpy(buffer->mapped, data, (size_t)size);
+    }
+    else ok = rlvkCreateDeviceLocalBuffer(data, buffer->size, usage, &buffer->buffer, &buffer->memory);
+
+    if (!ok)
+    {
+        memset(buffer, 0, sizeof(*buffer));
+        return 0;
+    }
+    return id;
+}
+
+unsigned int rlLoadVertexBuffer(const void *buffer, int size, bool dynamic)
+{
+    return rlvkLoadBuffer(buffer, size, dynamic, false);
+}
+
+unsigned int rlLoadVertexBufferElement(const void *buffer, int size, bool dynamic)
+{
+    return rlvkLoadBuffer(buffer, size, dynamic, true);
+}
+
+static void rlvkUpdateBuffer(unsigned int id, const void *data, int dataSize, int offset)
+{
+    rlvkBuffer *buffer = rlvkGetBuffer(id);
+    if ((buffer == NULL) || (data == NULL) || (dataSize <= 0)) return;
+    if ((VkDeviceSize)(offset + dataSize) > buffer->size)
+    {
+        TRACELOG(LOG_WARNING, "VBO: [ID %i] Update out of bounds (offset %i, size %i)", (int)id, offset, dataSize);
+        return;
+    }
+
+    if (buffer->mapped != NULL)
+    {
+        memcpy(buffer->mapped + offset, data, (size_t)dataSize);
+        return;
+    }
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    unsigned char *mapped = NULL;
+    if (!rlvkCreateBuffer((VkDeviceSize)dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging, &stagingMemory, &mapped)) return;
+    memcpy(mapped, data, (size_t)dataSize);
+
+    VkCommandBuffer cmd = rlvkBeginOneShot();
+    if (cmd != VK_NULL_HANDLE)
+    {
+        VkBufferCopy copy = { .dstOffset = (VkDeviceSize)offset, .size = (VkDeviceSize)dataSize };
+        vkCmdCopyBuffer(cmd, staging, buffer->buffer, 1, &copy);
+        rlvkEndOneShot(cmd);
+    }
+    rlvkDestroyBufferObject(staging, stagingMemory, true);
+}
+
+void rlUpdateVertexBuffer(unsigned int bufferId, const void *data, int dataSize, int offset)
+{
+    rlvkUpdateBuffer(bufferId, data, dataSize, offset);
+}
+
+void rlUpdateVertexBufferElements(unsigned int id, const void *data, int dataSize, int offset)
+{
+    rlvkUpdateBuffer(id, data, dataSize, offset);
+}
+
+void rlUnloadVertexBuffer(unsigned int vboId)
+{
+    rlvkBuffer *buffer = rlvkGetBuffer(vboId);
+    if (buffer == NULL) return;
+
+    rlvkFlushBeforeDestroy();
+    rlvkDestroyBufferObject(buffer->buffer, buffer->memory, buffer->mapped != NULL);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+void rlDrawMeshBuffers(const unsigned int *vboIds, int vertexCount, int indexCount,
+                       const Matrix *transforms, int instances)
+{
+    if ((vboIds == NULL) || (vertexCount <= 0)) return;
+    if (!rlvkEnsureRecording()) return;
+    if (instances < 1) instances = 1;
+
+    rlvkShader *shader = rlvkGetShader(RLVK.state.currentShaderId);
+    if (shader == NULL) return;
+
+    rlvkFlushBatch();
+    rlvkBeginRenderPass();
+    if (!RLVK.passActive) return;
+
+    VkCommandBuffer cmd = rlvkCurrentCmd();
+
+    unsigned int available = 0;
+    for (unsigned int i = 0; i < 8; i++)
+    {
+        if (rlvkGetBuffer(vboIds[i]) != NULL) available |= (1u << i);
+    }
+
+    bool useInstanceAttribute = (instances > 1) && ((shader->attribMask & (1u << RLVK_LOC_INSTANCE)) != 0) && (transforms != NULL);
+
+    rlvkPipelineKey key;
+    rlvkFillPipelineKey(&key, RL_TRIANGLES, useInstanceAttribute? RLVK_LAYOUT_MESH_INSTANCED : RLVK_LAYOUT_MESH, available);
+    VkPipeline pipeline = rlvkGetPipeline(&key);
+    if (pipeline == VK_NULL_HANDLE) return;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    VkDeviceSize zero = 0;
+    for (unsigned int i = 0; i < 8; i++)
+    {
+        rlvkBuffer *buffer = rlvkGetBuffer(vboIds[i]);
+        if (buffer == NULL) continue;
+        vkCmdBindVertexBuffers(cmd, i, 1, &buffer->buffer, &zero);
+    }
+    vkCmdBindVertexBuffers(cmd, RLVK_BINDING_DEFAULT, 1, &RLVK.defaultAttribBuffer, &zero);
+
+    if (useInstanceAttribute)
+    {
+        rlvkAlloc alloc = rlvkFrameAlloc((VkDeviceSize)instances*sizeof(Matrix), 16);
+        if (alloc.ptr == NULL) return;
+        // Vertex attributes read mat4 columns: upload in GLSL column-major order
+        for (int i = 0; i < instances; i++)
+        {
+            MatToFloats(transforms[i], (float *)(void *)(alloc.ptr + (size_t)i*16*sizeof(float)));
+        }
+        vkCmdBindVertexBuffers(cmd, RLVK_BINDING_INSTANCE, 1, &alloc.buffer, &alloc.offset);
+    }
+
+    VkDescriptorSet uniformSet = rlvkBuildUniformSet(shader);
+    if (uniformSet != VK_NULL_HANDLE) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout, 0, 1, &uniformSet, 0, NULL);
+
+    VkDescriptorSet textureSet = rlvkBuildTextureSet(0);
+    if (textureSet != VK_NULL_HANDLE) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout, 1, 1, &textureSet, 0, NULL);
+
+    rlvkBuffer *indexBuffer = rlvkGetBuffer(vboIds[8]);
+    bool indexed = (indexBuffer != NULL) && (indexCount > 0);
+    if (indexed) vkCmdBindIndexBuffer(cmd, indexBuffer->buffer, 0, VK_INDEX_TYPE_UINT16);
+
+    Matrix viewProjection = MatMul(RLVK.state.modelview, RLVK.state.projection);
+    viewProjection = MatMul(viewProjection, MatClipCorrection(rlvkTargetFlipsY()));
+
+    if (useInstanceAttribute)
+    {
+        Matrix model = RLVK.state.transformRequired? RLVK.state.transform : MatIdentity();
+        Matrix mvp = MatMul(model, viewProjection);
+        rlvkPushMatrices(cmd, mvp, model);
+        if (indexed) vkCmdDrawIndexed(cmd, (uint32_t)indexCount, (uint32_t)instances, 0, 0, 0);
+        else vkCmdDraw(cmd, (uint32_t)vertexCount, (uint32_t)instances, 0, 0);
+        return;
+    }
+
+    // Without an instancing shader, each instance is drawn with its own matModel push constant
+    for (int i = 0; i < instances; i++)
+    {
+        Matrix model = (transforms != NULL)? transforms[i] : MatIdentity();
+        if (RLVK.state.transformRequired) model = MatMul(model, RLVK.state.transform);
+        Matrix mvp = MatMul(model, viewProjection);
+        rlvkPushMatrices(cmd, mvp, model);
+
+        if (indexed) vkCmdDrawIndexed(cmd, (uint32_t)indexCount, 1, 0, 0, 0);
+        else vkCmdDraw(cmd, (uint32_t)vertexCount, 1, 0, 0);
+    }
+}
+
+//----------------------------------------------------------------------------------
+// Shader uniforms / binding
+//----------------------------------------------------------------------------------
+static unsigned int rlvkUniformTypeSize(int uniformType)
+{
+    switch (uniformType)
+    {
+        case SHADER_UNIFORM_FLOAT: case SHADER_UNIFORM_INT: case SHADER_UNIFORM_UINT: return 4;
+        case SHADER_UNIFORM_VEC2: case SHADER_UNIFORM_IVEC2: case SHADER_UNIFORM_UIVEC2: return 8;
+        case SHADER_UNIFORM_VEC3: case SHADER_UNIFORM_IVEC3: case SHADER_UNIFORM_UIVEC3: return 12;
+        case SHADER_UNIFORM_VEC4: case SHADER_UNIFORM_IVEC4: case SHADER_UNIFORM_UIVEC4: return 16;
+        case SHADER_UNIFORM_SAMPLER2D: return 4;
+        default: return 0;
+    }
+}
+
+void rlSetUniform(int locIndex, const void *value, int uniformType, int count)
+{
+    if ((locIndex < 0) || (value == NULL) || (count <= 0)) return;
+
+    if ((locIndex & RLVK_LOC_SAMPLER_FLAG) != 0)
+    {
+        int binding = locIndex & RLVK_LOC_SAMPLER_MASK;
+
+        // raylib idiom: SetShaderValue(shader, loc, (int[]){ unit }, SHADER_UNIFORM_INT)
+        // passes a TEXTURE UNIT index, not a texture id. Point the sampler at whatever is
+        // bound to that unit; rlSetUniformSampler() keeps the texture-id semantics.
+        if ((uniformType == SHADER_UNIFORM_INT) || (uniformType == SHADER_UNIFORM_UINT))
+        {
+            int unit = *(const int *)value;
+            if ((unit < 0) || (unit >= RLVK_MAX_TEXTURE_SLOTS))
+            {
+                if (!RLVK.state.samplerUnitWarned)
+                {
+                    TRACELOG(LOG_WARNING, "SHADER: Texture unit %i out of range, only %i units are available",
+                             unit, RLVK_MAX_TEXTURE_SLOTS);
+                    RLVK.state.samplerUnitWarned = true;
+                }
+                return;
+            }
+            if ((binding >= 0) && (binding < RLVK_MAX_TEXTURE_SLOTS) && (binding != unit))
+            {
+                rlvkFlushBatch();
+                RLVK.state.activeTextures[binding] = RLVK.state.activeTextures[unit];
+            }
+            return;
+        }
+
+        rlSetUniformSampler(locIndex, *(const unsigned int *)value);
+        return;
+    }
+    if ((locIndex & RLVK_LOC_PUSH_FLAG) != 0) return;   // mvp/matModel are managed by rlvk
+
+    rlvkShader *shader = rlvkGetShader(RLVK.state.currentShaderId);
+    if ((shader == NULL) || (shader->uboShadow == NULL)) return;
+
+    if (uniformType == SHADER_UNIFORM_SAMPLER2D)
+    {
+        rlSetUniformSampler(locIndex, *(const unsigned int *)value);
+        return;
+    }
+
+    unsigned int elementSize = rlvkUniformTypeSize(uniformType);
+    if (elementSize == 0) return;
+
+    // std140 arrays pad every element to 16 bytes
+    unsigned int stride = (count > 1)? ((elementSize + 15u) & ~15u) : elementSize;
+    const unsigned char *src = (const unsigned char *)value;
+
+    for (int i = 0; i < count; i++)
+    {
+        unsigned int offset = (unsigned int)locIndex + (unsigned int)i*stride;
+        if ((offset + elementSize) > shader->uboSize)
+        {
+            TRACELOG(LOG_WARNING, "SHADER: Uniform write out of UBO bounds (offset %u)", offset);
+            return;
+        }
+        memcpy(shader->uboShadow + offset, src + (size_t)i*elementSize, elementSize);
+    }
+}
+
+void rlSetUniformMatrix(int locIndex, Matrix mat)
+{
+    if (locIndex < 0) return;
+    if ((locIndex & RLVK_LOC_PUSH_FLAG) != 0) return;   // Driven by rlvk push constants
+
+    rlvkShader *shader = rlvkGetShader(RLVK.state.currentShaderId);
+    if ((shader == NULL) || (shader->uboShadow == NULL)) return;
+    if (((unsigned int)locIndex + 64u) > shader->uboSize)
+    {
+        TRACELOG(LOG_WARNING, "SHADER: Matrix uniform write out of UBO bounds (offset %i)", locIndex);
+        return;
+    }
+    MatToFloats(mat, (float *)(void *)(shader->uboShadow + locIndex));
+}
+
+void rlSetUniformMatrices(int locIndex, const Matrix *mat, int count)
+{
+    if ((locIndex < 0) || (mat == NULL) || (count <= 0)) return;
+    if ((locIndex & RLVK_LOC_PUSH_FLAG) != 0) return;
+
+    rlvkShader *shader = rlvkGetShader(RLVK.state.currentShaderId);
+    if ((shader == NULL) || (shader->uboShadow == NULL)) return;
+    if (((unsigned int)locIndex + 64u*(unsigned int)count) > shader->uboSize)
+    {
+        TRACELOG(LOG_WARNING, "SHADER: Matrix array write out of UBO bounds (offset %i, count %i)", locIndex, count);
+        return;
+    }
+    for (int i = 0; i < count; i++)
+    {
+        MatToFloats(mat[i], (float *)(void *)(shader->uboShadow + locIndex + (size_t)i*64));
+    }
+}
+
+void rlSetUniformSampler(int locIndex, unsigned int textureId)
+{
+    if (locIndex < 0) return;
+
+    int binding = ((locIndex & RLVK_LOC_SAMPLER_FLAG) != 0)? (locIndex & RLVK_LOC_SAMPLER_MASK) : locIndex;
+    if ((binding < 0) || (binding >= RLVK_MAX_TEXTURE_SLOTS))
+    {
+        TRACELOG(LOG_WARNING, "SHADER: Invalid sampler location %i", locIndex);
+        return;
+    }
+
+    rlvkFlushBatch();
+    RLVK.state.activeTextures[binding] = textureId;
+}
+
+void rlSetShader(unsigned int id, int *locs)
+{
+    if (RLVK.state.currentShaderId == id)
+    {
+        RLVK.state.currentShaderLocs = locs;
+        return;
+    }
+
+    rlvkFlushBatch();
+
+    rlvkShader *shader = rlvkGetShader(id);
+    if (shader == NULL)
+    {
+        RLVK.state.currentShaderId = RLVK.defaultShaderId;
+        RLVK.state.currentShaderLocs = RLVK.defaultShaderLocs;
+        return;
+    }
+
+    RLVK.state.currentShaderId = id;
+    RLVK.state.currentShaderLocs = locs;
+}
+
+void rlEnableShader(unsigned int id)
+{
+    rlvkShader *shader = rlvkGetShader(id);
+    if (shader == NULL) return;
+    if (RLVK.state.currentShaderId == id) return;
+
+    rlvkFlushBatch();
+    RLVK.state.currentShaderId = id;
+    RLVK.state.currentShaderLocs = shader->locs;
+}
+
+void rlDisableShader(void)
+{
+    if (RLVK.state.currentShaderId == RLVK.defaultShaderId) return;
+    rlvkFlushBatch();
+    RLVK.state.currentShaderId = RLVK.defaultShaderId;
+    RLVK.state.currentShaderLocs = RLVK.defaultShaderLocs;
+}
+
+//----------------------------------------------------------------------------------
+// rayvk.h - public Vulkan interop
+//----------------------------------------------------------------------------------
+void *GetVkInstance(void) { return (void *)RLVK.instance; }
+void *GetVkPhysicalDevice(void) { return (void *)RLVK.physicalDevice; }
+void *GetVkDevice(void) { return (void *)RLVK.device; }
+void *GetVkGraphicsQueue(void) { return (void *)RLVK.queue; }
+uint32_t GetVkGraphicsQueueFamily(void) { return RLVK.queueFamily; }
+uint64_t GetVkSwapchain(void) { return (uint64_t)RLVK.swapchain; }
+uint64_t GetVkSwapchainRenderPass(void) { return (uint64_t)RLVK.swapPassLoad; }
+int GetVkSwapchainImageCount(void) { return (int)RLVK.imageCount; }
+uint32_t GetVkSwapchainImageFormat(void) { return (uint32_t)RLVK.swapchainFormat; }
+uint32_t GetVkFrameIndex(void) { return RLVK.frameIndex; }
+
+uint64_t GetVkSwapchainImage(int index)
+{
+    if ((index < 0) || (index >= (int)RLVK.imageCount) || (RLVK.swapchainImages == NULL)) return 0;
+    return (uint64_t)RLVK.swapchainImages[index];
+}
+
+void *GetVkCurrentCommandBuffer(void)
+{
+    if (!rlvkEnsureRecording()) return NULL;
+
+    // Hand over a command buffer that is immediately usable for in-pass commands:
+    // flush pending raylib draws (so ordering matches the call site) and make sure
+    // the current target's render pass is active
+    rlvkFlushBatch();
+    rlvkBeginRenderPass();
+    if (!RLVK.passActive) return NULL;
+
+    return (void *)RLVK.frames[RLVK.frameIndex].cmd;
+}
+
+void *BeginVkCustomMode(void)
+{
+    if (!rlvkEnsureRecording()) return NULL;
+    rlvkFlushBatch();
+    rlvkEndRenderPass();
+    return (void *)RLVK.frames[RLVK.frameIndex].cmd;
+}
+
+void EndVkCustomMode(void)
+{
+    if (!RLVK.frameRecording) return;
+    // Re-open the target's render pass preserving its contents and restore dynamic state
+    rlvkBeginRenderPass();
+}
+
+void *BeginVkCommands(void)
+{
+    if (!RLVK.initialized) return NULL;
+    return (void *)rlvkBeginOneShot();
+}
+
+void EndVkCommands(void *commandBuffer)
+{
+    if (commandBuffer == NULL) return;
+    rlvkEndOneShot((VkCommandBuffer)commandBuffer);
+}
+
+void SubmitVkCommands(void *commandBuffer, uint64_t waitSemaphore, uint64_t signalSemaphore)
+{
+    if ((commandBuffer == NULL) || !RLVK.initialized) return;
+
+    VkCommandBuffer cmd = (VkCommandBuffer)commandBuffer;
+    vkEndCommandBuffer(cmd);
+
+    VkSemaphore wait = (VkSemaphore)waitSemaphore;
+    VkSemaphore signal = (VkSemaphore)signalSemaphore;
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd
+    };
+    if (wait != VK_NULL_HANDLE)
+    {
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &wait;
+        submit.pWaitDstStageMask = &waitStage;
+    }
+    if (signal != VK_NULL_HANDLE)
+    {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &signal;
+    }
+
+    VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    if (vkCreateFence(RLVK.device, &fenceInfo, NULL, &fence) != VK_SUCCESS)
+    {
+        vkQueueSubmit(RLVK.queue, 1, &submit, VK_NULL_HANDLE);
+        vkQueueWaitIdle(RLVK.queue);
+        vkFreeCommandBuffers(RLVK.device, RLVK.transientPool, 1, &cmd);
+        return;
+    }
+    vkQueueSubmit(RLVK.queue, 1, &submit, fence);
+
+    // Retained until the fence is observed signaled at a later frame boundary
+    if (RLVK.pendingCount == RLVK.pendingCapacity)
+    {
+        int newCapacity = (RLVK.pendingCapacity == 0)? 8 : RLVK.pendingCapacity*2;
+        rlvkPendingCmd *grown = (rlvkPendingCmd *)RL_REALLOC(RLVK.pending, (size_t)newCapacity*sizeof(rlvkPendingCmd));
+        if (grown == NULL)
+        {
+            vkWaitForFences(RLVK.device, 1, &fence, VK_TRUE, UINT64_MAX);
+            vkDestroyFence(RLVK.device, fence, NULL);
+            vkFreeCommandBuffers(RLVK.device, RLVK.transientPool, 1, &cmd);
+            return;
+        }
+        RLVK.pending = grown;
+        RLVK.pendingCapacity = newCapacity;
+    }
+    RLVK.pending[RLVK.pendingCount].cmd = cmd;
+    RLVK.pending[RLVK.pendingCount].fence = fence;
+    RLVK.pendingCount++;
+}

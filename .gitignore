@@ -1,0 +1,20 @@
+# Build trees
+build/
+build-*/
+
+# In-tree GNU make outputs (mirrors upstream raylib's src/Makefile behavior)
+*.o
+*.d
+*.exe
+src/librayvulkan.a
+src/generated/
+
+# SPIR-V compiled beside example shader sources
+examples/*/resources/shaders/vk/*.spv
+
+# Editor/tooling
+.cache/
+compile_commands.json
+
+# Claude Code session state
+.claude/

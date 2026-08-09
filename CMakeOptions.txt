@@ -1,0 +1,19 @@
+# ## Config options ###
+include(EnumOption)
+
+# Platform backend selection; auto-detected from the host unless set.
+# RAYVK_PLATFORM is accepted as a legacy alias for PLATFORM.
+if(DEFINED RAYVK_PLATFORM)
+    set(PLATFORM "${RAYVK_PLATFORM}" CACHE STRING "Platform backend to build for.")
+elseif(WIN32)
+    set(PLATFORM WIN32 CACHE STRING "Platform backend to build for.")
+elseif(APPLE)
+    set(PLATFORM MACOS CACHE STRING "Platform backend to build for.")
+elseif(ANDROID)
+    set(PLATFORM ANDROID CACHE STRING "Platform backend to build for.")
+endif()
+enum_option(PLATFORM "X11;WAYLAND;WIN32;MACOS;ANDROID" "Platform backend to build for.")
+
+# Configuration options
+option(BUILD_EXAMPLES "Build the examples." ${PROJECT_IS_TOP_LEVEL})
+option(BUILD_TESTING "Build the tests." ${PROJECT_IS_TOP_LEVEL})
